@@ -6,6 +6,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let recorder = AudioRecorder()
     private var cancellables = Set<AnyCancellable>()
+    private var liveCaptions: LiveCaptions?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -124,13 +125,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func startRecording() {
         Task {
-            do { try await recorder.startRecording() }
-            catch { NSLog("Recording failed: \(error)") }
+            do {
+                try await recorder.startRecording()
+
+                // TEMP smoke hook for Task 3 — logs captions to Console
+                let lc = LiveCaptions()
+                self.liveCaptions = lc
+                lc.onCaption = { ev in
+                    NSLog("[caption] [\(ev.startSec)-\(ev.endSec)] \(ev.text)")
+                }
+                recorder.onPCMChunk = { samples, rate in
+                    lc.append(samples, sampleRate: rate)
+                }
+                try await lc.start(sessionStart: Date())
+            } catch {
+                NSLog("Recording failed: \(error)")
+            }
         }
     }
 
     @objc private func stopRecording() {
-        Task { await recorder.stopRecording() }
+        Task {
+            await self.liveCaptions?.flush()
+            self.liveCaptions?.stop()
+            self.recorder.onPCMChunk = nil
+            self.liveCaptions = nil
+            await recorder.stopRecording()
+        }
     }
 
     @objc private func toggleMic() {

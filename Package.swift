@@ -29,6 +29,7 @@ let package = Package(
             sources: [
                 "MeetingRecorderApp.swift",
                 "AudioRecorder.swift",
+                "LiveCaptions.swift",
             ]
         )
     ]
