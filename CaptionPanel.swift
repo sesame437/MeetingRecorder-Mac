@@ -33,7 +33,7 @@ final class CaptionPanel {
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
         panel.minSize = NSSize(width: 420, height: 160)
-        panel.maxSize = NSSize(width: 2400, height: 1600)
+        panel.maxSize = NSSize(width: 1100, height: 1400)
 
         captionsLabel = NSTextField(labelWithString: "")
         captionsLabel.font = .systemFont(ofSize: 18, weight: .medium)
@@ -41,6 +41,10 @@ final class CaptionPanel {
         captionsLabel.alignment = .left
         captionsLabel.maximumNumberOfLines = 0   // unlimited; grows with window
         captionsLabel.lineBreakMode = .byWordWrapping
+        captionsLabel.isSelectable = true        // allow user to copy caption text
+        // Tell auto-layout to word-wrap at this width so the label's
+        // intrinsicContentSize never demands to be wider than the panel.
+        captionsLabel.preferredMaxLayoutWidth = 1068   // panel max 1100 - 16*2 padding
         captionsLabel.translatesAutoresizingMaskIntoConstraints = false
 
         separator = NSBox()
@@ -53,6 +57,8 @@ final class CaptionPanel {
         summaryLabel.alignment = .left
         summaryLabel.maximumNumberOfLines = 0
         summaryLabel.lineBreakMode = .byWordWrapping
+        summaryLabel.isSelectable = true         // allow user to copy summary text
+        summaryLabel.preferredMaxLayoutWidth = 1068   // panel max 1100 - 16*2 padding
         summaryLabel.translatesAutoresizingMaskIntoConstraints = false
 
         offlineBanner = NSTextField(labelWithString: "")
@@ -81,7 +87,16 @@ final class CaptionPanel {
         content.addSubview(separator)
         content.addSubview(summaryLabel)
 
+        // Cap the content view width so a single very long caption or
+        // summary does not push the window wider than panel.maxSize (NSPanel's
+        // maxSize only limits user-dragging; auto-layout from intrinsic size
+        // can still exceed it without an explicit content constraint).
+        let contentMaxWidth = content.widthAnchor.constraint(lessThanOrEqualToConstant: 1100)
+        contentMaxWidth.priority = .required
+
         NSLayoutConstraint.activate([
+            contentMaxWidth,
+
             // Offline banner pinned to top
             offlineContainer.topAnchor.constraint(equalTo: content.topAnchor),
             offlineContainer.leadingAnchor.constraint(equalTo: content.leadingAnchor),
