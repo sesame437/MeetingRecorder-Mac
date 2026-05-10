@@ -10,6 +10,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var captionPanel: CaptionPanel?
     private var transcriptBuffer: TranscriptBuffer?
     private var notesWriter: NotesWriter?
+    private var summaryClient: SummaryClient?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -161,6 +162,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     lc.append(samples, sampleRate: rate)
                 }
                 try await lc.start(sessionStart: sessionStart)
+
+                let summary = SummaryClient(sessionId: sessionId, buffer: buffer, sessionStart: sessionStart)
+                self.summaryClient = summary
+                summary.onSummary = { [weak panel, weak notes] s in
+                    panel?.renderSummary(s)
+                    try? notes?.updateSummary(s)
+                }
+                summary.onOffline = { [weak panel] reason in
+                    panel?.showOffline(reason)
+                }
+                summary.start(intervalSec: 180)
             } catch {
                 NSLog("Recording failed: \(error)")
             }
@@ -173,6 +185,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.liveCaptions?.stop()
             self.recorder.onPCMChunk = nil
             self.liveCaptions = nil
+
+            self.summaryClient?.stop()
+            if let summary = self.summaryClient {
+                do {
+                    let s = try await summary.triggerFinal()
+                    try? self.notesWriter?.updateSummary(s)
+                    self.captionPanel?.renderSummary(s)
+                } catch {
+                    NSLog("[AppDelegate] final summary failed: \(error)")
+                }
+            }
+            self.summaryClient = nil
+
             try? self.notesWriter?.setEnded(Date())
             self.notesWriter = nil
             self.transcriptBuffer = nil

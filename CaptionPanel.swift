@@ -160,16 +160,3 @@ final class CaptionPanel {
     }
 }
 
-// MARK: - Forward-compatible stub (replaced by SummaryClient.swift in Task 6)
-
-struct LiveSummary {
-    let summary: String
-    let highlights: [Point]
-    let lowlights: [Point]
-    let actions: [Action]
-    let decisions: [Decision]
-    let generatedAt: String
-    struct Point { let point: String; let detail: String }
-    struct Action { let task: String; let owner: String?; let deadline: String?; let priority: String? }
-    struct Decision { let decision: String; let rationale: String? }
-}

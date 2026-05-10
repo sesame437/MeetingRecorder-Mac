@@ -32,6 +32,7 @@ let package = Package(
                 "LiveCaptions.swift",
                 "CaptionPanel.swift",
                 "NotesWriter.swift",
+                "SummaryClient.swift",
             ]
         )
     ]
