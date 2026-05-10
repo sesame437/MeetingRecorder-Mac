@@ -1,0 +1,16 @@
+# SPM build output
+.build/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# Bundles and distribution
+MeetingRecorder.app/
+MeetingRecorder.dmg
+MeetingRecorder-v2.7.0.app/
+MeetingRecorder-v2.7.0-dual-track.dmg
+MeetingRecorder-v2.7.0.dmg
+
+# WhisperKit model cache (just in case it lands inside the project dir)
+WhisperKit/
