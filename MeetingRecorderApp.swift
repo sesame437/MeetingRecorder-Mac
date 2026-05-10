@@ -7,6 +7,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let recorder = AudioRecorder()
     private var cancellables = Set<AnyCancellable>()
     private var liveCaptions: LiveCaptions?
+    private var captionPanel: CaptionPanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -124,15 +125,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     @objc private func startRecording() {
-        Task {
+        Task { @MainActor in
             do {
                 try await recorder.startRecording()
 
-                // TEMP smoke hook for Task 3 — logs captions to Console
+                let panel = CaptionPanel()
+                self.captionPanel = panel
+                panel.show()
+
                 let lc = LiveCaptions()
                 self.liveCaptions = lc
-                lc.onCaption = { ev in
-                    NSLog("[caption] [\(ev.startSec)-\(ev.endSec)] \(ev.text)")
+                lc.onCaption = { [weak panel] ev in
+                    panel?.applyCaption(ev)
                 }
                 recorder.onPCMChunk = { samples, rate in
                     lc.append(samples, sampleRate: rate)
@@ -145,11 +149,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func stopRecording() {
-        Task {
+        Task { @MainActor in
             await self.liveCaptions?.flush()
             self.liveCaptions?.stop()
             self.recorder.onPCMChunk = nil
             self.liveCaptions = nil
+            self.captionPanel?.hide()
+            self.captionPanel = nil
             await recorder.stopRecording()
         }
     }

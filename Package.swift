@@ -30,6 +30,7 @@ let package = Package(
                 "MeetingRecorderApp.swift",
                 "AudioRecorder.swift",
                 "LiveCaptions.swift",
+                "CaptionPanel.swift",
             ]
         )
     ]
