@@ -13,19 +13,16 @@ MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 DMG_PATH="$SCRIPT_DIR/MeetingRecorder.dmg"
 
-# 1. Build both slices via SPM
-echo "Building arm64..."
+# 1. Build arm64 release (Apple Silicon only, per user preference)
+echo "Building arm64 release..."
 swift build -c release --arch arm64
-echo "Building x86_64..."
-swift build -c release --arch x86_64
 
 # 2. Assemble .app bundle
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
 
 ARM64_BIN=".build/arm64-apple-macosx/release/MeetingRecorder"
-X86_BIN=".build/x86_64-apple-macosx/release/MeetingRecorder"
-lipo -create "$ARM64_BIN" "$X86_BIN" -output "$MACOS/MeetingRecorder"
+cp "$ARM64_BIN" "$MACOS/MeetingRecorder"
 
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
 if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
