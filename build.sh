@@ -1,54 +1,34 @@
 #!/bin/bash
 set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR"
+
 APP_DIR="$SCRIPT_DIR/MeetingRecorder.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 DMG_PATH="$SCRIPT_DIR/MeetingRecorder.dmg"
 
+# 1. Build both slices via SPM
+echo "Building arm64..."
+swift build -c release --arch arm64
+echo "Building x86_64..."
+swift build -c release --arch x86_64
+
+# 2. Assemble .app bundle
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
 
-# Compile Universal Binary (arm64 + x86_64)
-echo "Compiling arm64..."
-swiftc \
-    "$SCRIPT_DIR/AudioRecorder.swift" \
-    "$SCRIPT_DIR/MeetingRecorderApp.swift" \
-    -o "$MACOS/MeetingRecorder-arm64" \
-    -sdk "$(xcrun --show-sdk-path)" \
-    -target arm64-apple-macosx15.0 \
-    -framework ScreenCaptureKit \
-    -framework AVFoundation \
-    -framework CoreMedia \
-    -framework UserNotifications
+ARM64_BIN=".build/arm64-apple-macosx/release/MeetingRecorder"
+X86_BIN=".build/x86_64-apple-macosx/release/MeetingRecorder"
+lipo -create "$ARM64_BIN" "$X86_BIN" -output "$MACOS/MeetingRecorder"
 
-echo "Compiling x86_64..."
-swiftc \
-    "$SCRIPT_DIR/AudioRecorder.swift" \
-    "$SCRIPT_DIR/MeetingRecorderApp.swift" \
-    -o "$MACOS/MeetingRecorder-x86_64" \
-    -sdk "$(xcrun --show-sdk-path)" \
-    -target x86_64-apple-macosx15.0 \
-    -framework ScreenCaptureKit \
-    -framework AVFoundation \
-    -framework CoreMedia \
-    -framework UserNotifications
-
-echo "Creating Universal Binary..."
-lipo -create \
-    "$MACOS/MeetingRecorder-arm64" \
-    "$MACOS/MeetingRecorder-x86_64" \
-    -output "$MACOS/MeetingRecorder"
-rm "$MACOS/MeetingRecorder-arm64" "$MACOS/MeetingRecorder-x86_64"
-
-# Bundle resources
 cp "$SCRIPT_DIR/Info.plist" "$CONTENTS/Info.plist"
 if [ -f "$SCRIPT_DIR/AppIcon.icns" ]; then
     cp "$SCRIPT_DIR/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 fi
 
-# Ad-hoc code sign
+# 3. Ad-hoc sign
 codesign --force --sign - --entitlements /dev/stdin "$APP_DIR" <<ENTITLEMENTS
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -58,27 +38,21 @@ codesign --force --sign - --entitlements /dev/stdin "$APP_DIR" <<ENTITLEMENTS
     <true/>
     <key>com.apple.security.device.screen-capture</key>
     <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
 </dict>
 </plist>
 ENTITLEMENTS
 
 echo "Built: $APP_DIR"
 
-# Create DMG
+# 4. DMG
 rm -f "$DMG_PATH"
-echo "Creating DMG..."
-
-# Create temp dir with app + Applications symlink
 DMG_TMP="$SCRIPT_DIR/.dmg-tmp"
 rm -rf "$DMG_TMP"
 mkdir -p "$DMG_TMP"
 cp -R "$APP_DIR" "$DMG_TMP/"
 ln -s /Applications "$DMG_TMP/Applications"
-
-hdiutil create -volname "MeetingRecorder" \
-    -srcfolder "$DMG_TMP" \
-    -ov -format UDZO \
-    "$DMG_PATH" >/dev/null
-
+hdiutil create -volname "MeetingRecorder" -srcfolder "$DMG_TMP" -ov -format UDZO "$DMG_PATH" >/dev/null
 rm -rf "$DMG_TMP"
 echo "DMG: $DMG_PATH"
