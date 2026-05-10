@@ -20,6 +20,12 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         didSet { UserDefaults.standard.set(selectedMicID, forKey: "selectedMicID") }
     }
 
+    /// Fan-out of the post-mixed audio for live captions.
+    /// Called from the SCStream audio queue (NOT main). The closure receives
+    /// Float32 mono samples downsampled to 16 kHz along with that sample rate.
+    /// Nil by default; AppDelegate wires this up when captions are enabled.
+    var onPCMChunk: (([Float], Double) -> Void)?
+
     private var stream: SCStream?
     private var assetWriter: AVAssetWriter?
     private var audioWriterInput: AVAssetWriterInput?  // single mixed track
@@ -211,6 +217,11 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
             }
         } else {
             input.append(interleaved)
+        }
+
+        // Fan out to live captions (no-op if callback is nil)
+        if let onPCM = onPCMChunk, let samples = Self.convertToFloat32Mono16k(sampleBuffer) {
+            onPCM(samples, 16_000)
         }
     }
 
@@ -491,5 +502,69 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         var errorDescription: String? {
             switch self { case .noDisplay: return "No display found" }
         }
+    }
+
+    // MARK: - PCM tap (for live captions)
+
+    /// Downmix a CMSampleBuffer (float32 layout at any sample rate) into
+    /// Float32 mono at 16 kHz. Returns nil on any failure; the caller must
+    /// treat nil as "skip this chunk" and continue.
+    nonisolated private static func convertToFloat32Mono16k(_ sampleBuffer: CMSampleBuffer) -> [Float]? {
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return nil }
+        let srcFmt = asbdPtr.pointee
+        guard (srcFmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0 else { return nil }
+        guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return nil }
+
+        let totalBytes = CMBlockBufferGetDataLength(dataBuffer)
+        guard totalBytes > 0 else { return nil }
+
+        var raw = Data(count: totalBytes)
+        raw.withUnsafeMutableBytes { ptr in
+            guard let base = ptr.baseAddress else { return }
+            CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: totalBytes, destination: base)
+        }
+
+        let numChannels = Int(srcFmt.mChannelsPerFrame)
+        let numFrames = CMSampleBufferGetNumSamples(sampleBuffer)
+        guard numChannels > 0, numFrames > 0 else { return nil }
+
+        // Step 1: downmix to mono @ source sample rate
+        var mono = [Float](repeating: 0, count: numFrames)
+        raw.withUnsafeBytes { rawPtr in
+            let src = rawPtr.bindMemory(to: Float.self)
+            if (srcFmt.mFormatFlags & kAudioFormatFlagIsNonInterleaved) == 0 {
+                // interleaved
+                for i in 0..<numFrames {
+                    var sum: Float = 0
+                    for ch in 0..<numChannels { sum += src[i * numChannels + ch] }
+                    mono[i] = sum / Float(numChannels)
+                }
+            } else {
+                // non-interleaved: channels stored sequentially, numFrames per channel
+                for i in 0..<numFrames {
+                    var sum: Float = 0
+                    for ch in 0..<numChannels { sum += src[ch * numFrames + i] }
+                    mono[i] = sum / Float(numChannels)
+                }
+            }
+        }
+
+        // Step 2: resample to 16 kHz
+        let srcRate = srcFmt.mSampleRate
+        let dstRate: Double = 16_000
+        if abs(srcRate - dstRate) < 1.0 { return mono }
+        let ratio = dstRate / srcRate
+        let outCount = max(1, Int(Double(numFrames) * ratio))
+        var out = [Float](repeating: 0, count: outCount)
+        for i in 0..<outCount {
+            let srcIdx = Double(i) / ratio
+            let idx0 = Int(srcIdx)
+            let frac = Float(srcIdx - Double(idx0))
+            let s0 = idx0 < numFrames ? mono[idx0] : 0
+            let s1 = (idx0 + 1) < numFrames ? mono[idx0 + 1] : s0
+            out[i] = s0 + frac * (s1 - s0)
+        }
+        return out
     }
 }
