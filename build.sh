@@ -3,6 +3,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Neutralize global git `url.git@github.com:.insteadof` rewrite — SPM clones
+# over HTTPS and would otherwise fail on machines without a loaded SSH key.
+export GIT_CONFIG_GLOBAL=/dev/null
+
 APP_DIR="$SCRIPT_DIR/MeetingRecorder.app"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
