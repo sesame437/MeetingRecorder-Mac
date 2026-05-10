@@ -32,6 +32,8 @@ final class CaptionPanel {
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.isReleasedWhenClosed = false
+        panel.minSize = NSSize(width: 420, height: 160)
+        panel.maxSize = NSSize(width: 2400, height: 1600)
 
         captionsLabel = NSTextField(labelWithString: "")
         captionsLabel.font = .systemFont(ofSize: 22, weight: .medium)
@@ -67,6 +69,13 @@ final class CaptionPanel {
         offlineContainer.isHidden = true
 
         let content = NSView()
+        content.wantsLayer = true
+        // Thin visible border so the user can see where the panel edges are
+        // (titlebarAppearsTransparent + black bg otherwise hides them, which
+        // makes the resize hit-zones impossible to find).
+        content.layer?.borderColor = NSColor.white.withAlphaComponent(0.18).cgColor
+        content.layer?.borderWidth = 1
+        content.layer?.cornerRadius = 8
         content.addSubview(offlineContainer)
         content.addSubview(captionsLabel)
         content.addSubview(separator)
