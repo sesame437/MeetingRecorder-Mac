@@ -215,19 +215,20 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         // Convert system audio to interleaved float32
         guard let interleaved = convertToInterleaved(sampleBuffer) else { return }
 
-        // Mix mic audio into system audio buffer
-        if useMicrophone {
-            if let mixed = mixMicInto(interleaved) {
-                input.append(mixed)
-            } else {
-                input.append(interleaved)
-            }
+        // Mix mic audio into system audio buffer. Whichever buffer we feed
+        // to AVAssetWriter (`outgoing`) is also what we tap for captions —
+        // otherwise captions would only see system audio and miss the user's
+        // own voice entirely.
+        let outgoing: CMSampleBuffer
+        if useMicrophone, let mixed = mixMicInto(interleaved) {
+            outgoing = mixed
         } else {
-            input.append(interleaved)
+            outgoing = interleaved
         }
+        input.append(outgoing)
 
         // Fan out to live captions (no-op if callback is nil)
-        if let onPCM = onPCMChunk, let samples = Self.convertToFloat32Mono16k(sampleBuffer) {
+        if let onPCM = onPCMChunk, let samples = Self.convertToFloat32Mono16k(outgoing) {
             onPCM(samples, 16_000)
         }
     }
