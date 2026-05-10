@@ -13,11 +13,11 @@ final class CaptionPanel {
     private let separator: NSBox
 
     private var recentCaptions: [String] = []
-    private let maxCaptionLines = 3
+    private let maxCaptionLines = 10
 
     init() {
         panel = NSPanel(
-            contentRect: NSRect(x: 240, y: 100, width: 820, height: 260),
+            contentRect: NSRect(x: 240, y: 100, width: 820, height: 520),
             styleMask: [.nonactivatingPanel, .titled, .closable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -36,10 +36,10 @@ final class CaptionPanel {
         panel.maxSize = NSSize(width: 2400, height: 1600)
 
         captionsLabel = NSTextField(labelWithString: "")
-        captionsLabel.font = .systemFont(ofSize: 22, weight: .medium)
+        captionsLabel.font = .systemFont(ofSize: 18, weight: .medium)
         captionsLabel.textColor = .white
         captionsLabel.alignment = .left
-        captionsLabel.maximumNumberOfLines = maxCaptionLines
+        captionsLabel.maximumNumberOfLines = 0   // unlimited; grows with window
         captionsLabel.lineBreakMode = .byWordWrapping
         captionsLabel.translatesAutoresizingMaskIntoConstraints = false
 
