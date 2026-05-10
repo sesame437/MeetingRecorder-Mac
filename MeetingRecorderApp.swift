@@ -81,6 +81,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         micToggle.state = recorder.useMicrophone ? .on : .off
         menu.addItem(micToggle)
 
+        // Live captions toggle
+        let capToggle = NSMenuItem(title: "Enable Live Captions", action: #selector(toggleCaptions), keyEquivalent: "")
+        capToggle.target = self
+        capToggle.state = recorder.captionsEnabled ? .on : .off
+        menu.addItem(capToggle)
+
         // Mic device selector (submenu)
         if recorder.useMicrophone {
             let micMenu = NSMenu()
@@ -131,6 +137,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             do {
                 try await recorder.startRecording()
+                guard recorder.captionsEnabled else { return }
 
                 guard let recordingURL = recorder.currentRecordingURL() else {
                     NSLog("[AppDelegate] no recording URL; skipping caption setup")
@@ -161,7 +168,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 recorder.onPCMChunk = { samples, rate in
                     lc.append(samples, sampleRate: rate)
                 }
-                try await lc.start(sessionStart: sessionStart)
+                do {
+                    try await lc.start(sessionStart: sessionStart)
+                } catch {
+                    NSLog("[AppDelegate] WhisperKit load failed: \(error)")
+                    panel.showOffline("captions unavailable — model load failed")
+                    return
+                }
 
                 let summary = SummaryClient(sessionId: sessionId, buffer: buffer, sessionStart: sessionStart)
                 self.summaryClient = summary
@@ -209,6 +222,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleMic() {
         recorder.useMicrophone.toggle()
+        rebuildMenu()
+    }
+
+    @objc private func toggleCaptions() {
+        recorder.captionsEnabled.toggle()
         rebuildMenu()
     }
 

@@ -11,6 +11,9 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
     @Published var useMicrophone: Bool {
         didSet { UserDefaults.standard.set(useMicrophone, forKey: "useMicrophone") }
     }
+    @Published var captionsEnabled: Bool {
+        didSet { UserDefaults.standard.set(captionsEnabled, forKey: "captionsEnabled") }
+    }
     @Published var saveDirectory: URL {
         didSet { UserDefaults.standard.set(saveDirectory.path, forKey: "saveDirectory") }
     }
@@ -44,6 +47,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
 
     override init() {
         self.useMicrophone = UserDefaults.standard.object(forKey: "useMicrophone") as? Bool ?? true
+        self.captionsEnabled = UserDefaults.standard.object(forKey: "captionsEnabled") as? Bool ?? false
         self.selectedMicID = UserDefaults.standard.string(forKey: "selectedMicID")
         if let path = UserDefaults.standard.string(forKey: "saveDirectory") {
             self.saveDirectory = URL(fileURLWithPath: path)
