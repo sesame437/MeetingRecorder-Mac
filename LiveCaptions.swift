@@ -42,7 +42,25 @@ final class LiveCaptions {
     /// Load WhisperKit and reset state. Throws if the model fails to load.
     /// Caller typically awaits this before the user starts speaking.
     func start(sessionStart: Date) async throws {
-        let cfg = WhisperKitConfig(model: modelName)
+        // If the model has already been downloaded to the default HF location,
+        // pass it as modelFolder so WhisperKit skips the network round-trip
+        // (setupModels() only hits HF when no folder is supplied — and it does
+        //  so on every startup, which breaks captions whenever the user is
+        //  offline or behind a restrictive network).
+        let localFolder = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("huggingface/models/argmaxinc/whisperkit-coreml/\(modelName)")
+        let hasLocal = FileManager.default.fileExists(atPath: localFolder.path)
+
+        let cfg: WhisperKitConfig
+        if hasLocal {
+            // Offline-friendly path: load directly from local folder, no network.
+            cfg = WhisperKitConfig(model: modelName, modelFolder: localFolder.path, load: true)
+        } else {
+            // First launch — requires network to download ~465 MB.
+            cfg = WhisperKitConfig(model: modelName, load: true)
+        }
+
         let instance = try await WhisperKit(cfg)
         queue.sync {
             self.whisper = instance
