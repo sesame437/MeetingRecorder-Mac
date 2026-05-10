@@ -8,6 +8,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellables = Set<AnyCancellable>()
     private var liveCaptions: LiveCaptions?
     private var captionPanel: CaptionPanel?
+    private var transcriptBuffer: TranscriptBuffer?
+    private var notesWriter: NotesWriter?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -129,19 +131,36 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await recorder.startRecording()
 
+                guard let recordingURL = recorder.currentRecordingURL() else {
+                    NSLog("[AppDelegate] no recording URL; skipping caption setup")
+                    return
+                }
+                let sessionStart = Date()
+                let sessionId = UUID()
+                let mdURL = recordingURL.deletingPathExtension().appendingPathExtension("md")
+
                 let panel = CaptionPanel()
                 self.captionPanel = panel
                 panel.show()
 
+                let buffer = TranscriptBuffer()
+                self.transcriptBuffer = buffer
+                let notes = NotesWriter(mdURL: mdURL, recordingURL: recordingURL,
+                                         startedAt: sessionStart, sessionId: sessionId)
+                self.notesWriter = notes
+
                 let lc = LiveCaptions()
                 self.liveCaptions = lc
-                lc.onCaption = { [weak panel] ev in
+                lc.onCaption = { [weak panel, weak buffer, weak notes] ev in
                     panel?.applyCaption(ev)
+                    let entry = TranscriptEntry(startSec: ev.startSec, endSec: ev.endSec, text: ev.text)
+                    buffer?.append(entry)
+                    try? notes?.appendTranscript(entry)
                 }
                 recorder.onPCMChunk = { samples, rate in
                     lc.append(samples, sampleRate: rate)
                 }
-                try await lc.start(sessionStart: Date())
+                try await lc.start(sessionStart: sessionStart)
             } catch {
                 NSLog("Recording failed: \(error)")
             }
@@ -154,6 +173,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.liveCaptions?.stop()
             self.recorder.onPCMChunk = nil
             self.liveCaptions = nil
+            try? self.notesWriter?.setEnded(Date())
+            self.notesWriter = nil
+            self.transcriptBuffer = nil
             self.captionPanel?.hide()
             self.captionPanel = nil
             await recorder.stopRecording()

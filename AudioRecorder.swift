@@ -53,6 +53,9 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         super.init()
     }
 
+    /// Current recording destination, or nil if not recording.
+    func currentRecordingURL() -> URL? { currentOutputURL }
+
     // MARK: - Device listing
 
     static func availableMicrophones() -> [AVCaptureDevice] {

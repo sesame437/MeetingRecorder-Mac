@@ -31,6 +31,7 @@ let package = Package(
                 "AudioRecorder.swift",
                 "LiveCaptions.swift",
                 "CaptionPanel.swift",
+                "NotesWriter.swift",
             ]
         )
     ]
