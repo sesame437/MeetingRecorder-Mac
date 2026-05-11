@@ -171,20 +171,54 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
 
     // MARK: - Mic capture
 
+    /// Resolve which microphone to use, falling back through a chain so we
+    /// never silently fail when the user's previously-selected device has
+    /// disappeared (e.g., headphones unplugged, BT disconnected).
+    ///
+    /// Order:
+    ///   1. selectedMicID if its device is still present
+    ///   2. the built-in "MacBook Pro Microphone" (or any device whose name
+    ///      contains "Built-In" / "Built-in" / "内置麦克风")
+    ///   3. AVCaptureDevice.default(for: .audio) — whatever the system default is
+    ///   4. any mic discovered via DiscoverySession
+    private func resolveMicrophone() -> AVCaptureDevice? {
+        let all = Self.availableMicrophones()
+
+        if let id = selectedMicID,
+           let dev = all.first(where: { $0.uniqueID == id }) {
+            return dev
+        }
+
+        if let builtIn = all.first(where: {
+            let name = $0.localizedName
+            return name.contains("MacBook Pro Microphone")
+                || name.contains("MacBook Air Microphone")
+                || name.range(of: "built-in", options: .caseInsensitive) != nil
+                || name.contains("内置麦克风")
+        }) {
+            return builtIn
+        }
+
+        if let sysDefault = AVCaptureDevice.default(for: .audio) {
+            return sysDefault
+        }
+
+        return all.first
+    }
+
     private func setupMicCapture() {
         let session = AVCaptureSession()
-        let mic: AVCaptureDevice?
-        if let id = selectedMicID {
-            mic = AVCaptureDevice(uniqueID: id)
-        } else {
-            mic = AVCaptureDevice.default(for: .audio)
-        }
-        guard let micDevice = mic,
+        guard let micDevice = resolveMicrophone(),
               let micSource = try? AVCaptureDeviceInput(device: micDevice) else {
-            NSLog("recorder: failed to open mic")
+            NSLog("recorder: failed to open mic — no available devices")
             return
         }
-        NSLog("recorder: mic = \(micDevice.localizedName)")
+        NSLog("recorder: mic = \(micDevice.localizedName) [\(micDevice.uniqueID)]")
+        // If we fell back from a stale selectedMicID, sync UserDefaults so the
+        // menu tick mark shows the device we actually opened.
+        if selectedMicID != micDevice.uniqueID {
+            selectedMicID = micDevice.uniqueID
+        }
         session.addInput(micSource)
 
         let audioOutput = AVCaptureAudioDataOutput()
