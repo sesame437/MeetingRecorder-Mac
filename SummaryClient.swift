@@ -28,9 +28,9 @@ enum SummaryError: Error {
 
 enum LiveSummaryConfig {
     static var backendURL: URL {
-        let raw = ProcessInfo.processInfo.environment["LIVE_SUMMARY_URL"]
-            ?? "http://localhost:3300"
-        return URL(string: raw) ?? URL(string: "http://localhost:3300")!
+        let fallback = "https://your-backend.example.com"
+        let raw = ProcessInfo.processInfo.environment["LIVE_SUMMARY_URL"] ?? fallback
+        return URL(string: raw) ?? URL(string: fallback)!
     }
     static var apiKey: String? {
         ProcessInfo.processInfo.environment["LIVE_SUMMARY_API_KEY"]
