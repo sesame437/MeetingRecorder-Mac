@@ -19,7 +19,12 @@ struct TranscriptEntry {
 
 /// In-process WhisperKit wrapper. `append` is thread-safe; `onCaption` is always
 /// invoked on the main queue. Not @MainActor — append() runs on the audio queue.
-final class LiveCaptions {
+///
+/// `@unchecked Sendable` is honest here: every piece of mutable state below is
+/// either confined to the serial `queue` or only touched from main, and we
+/// cross queue boundaries inside `Task.detached` / `DispatchQueue.async`
+/// closures (which are themselves @Sendable in Swift 6).
+final class LiveCaptions: @unchecked Sendable {
     /// Invoked on DispatchQueue.main after each transcription window completes.
     var onCaption: ((CaptionEvent) -> Void)?
 

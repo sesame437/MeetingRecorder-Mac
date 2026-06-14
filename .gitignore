@@ -4,6 +4,7 @@ Package.resolved
 
 # macOS
 .DS_Store
+.metadata_never_index
 
 # Bundles and distribution
 MeetingRecorder.app/

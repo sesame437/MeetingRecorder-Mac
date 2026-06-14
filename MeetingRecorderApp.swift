@@ -5,6 +5,7 @@ import AVFoundation
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let recorder = AudioRecorder()
+    private let defaultInputWatcher = DefaultInputWatcher()
     private var cancellables = Set<AnyCancellable>()
     private var liveCaptions: LiveCaptions?
     private var captionPanel: CaptionPanel?
@@ -14,6 +15,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Resolve mic via the fallback chain before drawing the menu, so a
+        // stale selectedMicID (e.g., headphones unplugged since last launch)
+        // doesn't leave the submenu with nothing ticked.
+        recorder.ensureMicSelection()
         updateIcon()
         rebuildMenu()
 
@@ -28,6 +33,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .throttle(for: .milliseconds(500), scheduler: RunLoop.main, latest: true)
             .sink { [weak self] _ in self?.rebuildMenu() }
             .store(in: &cancellables)
+
+        // Auto-follow the macOS system default input device. Plugging in
+        // a USB headset (or any system-level routing change) bumps our
+        // selectedMicID and, if currently recording, swaps the live
+        // capture session over to the new device. Suppressed once the
+        // user manually picks a mic from our menu — see `userPinnedMic`.
+        defaultInputWatcher.onChange = { [weak self] uid in
+            guard let self else { return }
+            self.recorder.switchMicDevice(to: uid, manual: false)
+            self.rebuildMenu()
+        }
+        defaultInputWatcher.start()
+        if let uid = defaultInputWatcher.currentDefaultInputUID() {
+            recorder.switchMicDevice(to: uid, manual: false)
+            rebuildMenu()
+        }
     }
 
     private func updateIcon() {
@@ -232,7 +253,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func selectMic(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? String {
-            recorder.selectedMicID = id
+            recorder.switchMicDevice(to: id)
             rebuildMenu()
         }
     }

@@ -5,7 +5,11 @@ import CoreMedia
 import Combine
 import UserNotifications
 
-class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioDataOutputSampleBufferDelegate {
+// `@unchecked Sendable`: every mutable field below is either confined to the
+// main queue (the @Published ones) or guarded by `micBufferLock`. Crossing
+// queue boundaries via Timer / DispatchQueue.main.async would otherwise trip
+// Swift 6 strict-concurrency warnings on every `self` capture.
+class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     @Published var isRecording = false
     @Published var elapsedTime: TimeInterval = 0
     @Published var useMicrophone: Bool {
@@ -45,6 +49,14 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
     private var micConverter: AVAudioConverter?
     private let targetSampleRate: Double = 48000
 
+    /// Set when the user explicitly picks a mic from our menu during a
+    /// session. While true, the system-default-input watcher won't override
+    /// the choice — otherwise plugging in a USB headset (or other system
+    /// routing change) would yank the recording away from what the user
+    /// just selected. Reset on every recording start/stop so each session
+    /// begins with auto-follow re-enabled.
+    private var userPinnedMic = false
+
     override init() {
         self.useMicrophone = UserDefaults.standard.object(forKey: "useMicrophone") as? Bool ?? true
         self.captionsEnabled = UserDefaults.standard.object(forKey: "captionsEnabled") as? Bool ?? false
@@ -73,6 +85,8 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
     // MARK: - Public
 
     func startRecording() async throws {
+        // Each session starts with auto-follow re-enabled.
+        userPinnedMic = false
         if useMicrophone {
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             NSLog("recorder: mic permission=\(granted)")
@@ -104,10 +118,9 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         self.assetWriter = writer
         self.audioWriterInput = input
 
-        // Reset mic buffer
-        micBufferLock.lock()
-        micBuffer.removeAll()
-        micBufferLock.unlock()
+        // Reset mic buffer. Use `withLock` so this stays valid in an async
+        // context — `lock()/unlock()` is unavailable from async in Swift 6.
+        micBufferLock.withLock { micBuffer.removeAll() }
         micConverter = nil
 
         // SCKit for system audio
@@ -165,6 +178,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         elapsedTime = 0
         systemAudioLevel = 0
         micAudioLevel = 0
+        userPinnedMic = false
 
         if let url = savedURL { sendNotification(filename: url.lastPathComponent) }
     }
@@ -181,6 +195,17 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
     ///      contains "Built-In" / "Built-in" / "内置麦克风")
     ///   3. AVCaptureDevice.default(for: .audio) — whatever the system default is
     ///   4. any mic discovered via DiscoverySession
+    /// Run the fallback chain and persist the result to `selectedMicID`, so
+    /// the menu's tick mark and the eventual recording path agree on which
+    /// mic is current — even before the user starts recording. Call at launch
+    /// and whenever the menu is about to be rebuilt.
+    func ensureMicSelection() {
+        guard let dev = resolveMicrophone() else { return }
+        if selectedMicID != dev.uniqueID {
+            selectedMicID = dev.uniqueID
+        }
+    }
+
     private func resolveMicrophone() -> AVCaptureDevice? {
         let all = Self.availableMicrophones()
 
@@ -204,6 +229,66 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         }
 
         return all.first
+    }
+
+    /// Switch the active microphone. Persists the preference and, if a
+    /// recording is in progress with mic enabled, swaps the input on the
+    /// running AVCaptureSession in place. Without this the menu only updated
+    /// UserDefaults; the live session kept the original device, so picking
+    /// a different mic mid-record had no effect on what got recorded.
+    ///
+    /// `manual` distinguishes user-driven menu picks from the automatic
+    /// system-default follower. A manual pick latches `userPinnedMic` so
+    /// later auto-follow events can't yank the device away from the user's
+    /// explicit choice for the rest of this session.
+    func switchMicDevice(to id: String, manual: Bool = true) {
+        if !manual && userPinnedMic { return }
+        // Don't write through a stale or unknown UID — caller may pass us a
+        // CoreAudio device that isn't a capture device (output-only,
+        // aggregate, etc.).
+        guard Self.availableMicrophones().contains(where: { $0.uniqueID == id }) else {
+            NSLog("recorder: switchMicDevice — unknown device UID \(id)")
+            return
+        }
+        if manual { userPinnedMic = true }
+        selectedMicID = id
+        guard isRecording, useMicrophone else { return }
+        guard let session = captureSession else {
+            setupMicCapture()
+            return
+        }
+        if let current = session.inputs.first as? AVCaptureDeviceInput,
+           current.device.uniqueID == id {
+            return
+        }
+        guard let dev = Self.availableMicrophones().first(where: { $0.uniqueID == id }),
+              let newInput = try? AVCaptureDeviceInput(device: dev) else {
+            NSLog("recorder: switchMicDevice — device unavailable for \(id)")
+            return
+        }
+
+        let oldInputs = session.inputs
+        session.beginConfiguration()
+        oldInputs.forEach { session.removeInput($0) }
+        if session.canAddInput(newInput) {
+            session.addInput(newInput)
+            session.commitConfiguration()
+            // If CoreAudio interrupted us when the device topology changed
+            // (common when an external mic gets auto-promoted to system
+            // default), the session is no longer running. Kick it back up.
+            if !session.isRunning { session.startRunning() }
+            // Drop samples from the previous device so we don't briefly mix
+            // both voices into the next output buffer.
+            micBufferLock.lock()
+            micBuffer.removeAll()
+            micBufferLock.unlock()
+            micConverter = nil
+            NSLog("recorder: switched mic → \(dev.localizedName) [\(id)]")
+        } else {
+            oldInputs.forEach { if session.canAddInput($0) { session.addInput($0) } }
+            session.commitConfiguration()
+            NSLog("recorder: cannot add \(dev.localizedName); kept previous mic")
+        }
     }
 
     private func setupMicCapture() {
