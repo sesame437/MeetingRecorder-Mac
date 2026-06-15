@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import AVFoundation
+import UserNotifications
 
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
@@ -12,6 +13,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var transcriptBuffer: TranscriptBuffer?
     private var notesWriter: NotesWriter?
     private var summaryClient: SummaryClient?
+    // Verbatim transcript pipeline. All three are nil when not recording, or
+    // when the pipeline failed to start (soft-fail per the agreed contract).
+    private var whisperServer: WhisperServerProcess?
+    private var verbatimWriter: VerbatimWriter?
+    private var verbatimTranscriber: VerbatimTranscriber?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -108,6 +114,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         capToggle.state = recorder.captionsEnabled ? .on : .off
         menu.addItem(capToggle)
 
+        // Caption / verbatim language selector. Drives whisper-server
+        // --language flag and the .verbatim.md frontmatter "language:" field.
+        let langMenu = NSMenu()
+        let currentLang = recorder.captionLanguage
+        for code in ["auto", "zh", "en"] {
+            let item = NSMenuItem(title: Self.languageLabel(for: code),
+                                  action: #selector(setCaptionLanguage(_:)),
+                                  keyEquivalent: "")
+            item.target = self
+            item.representedObject = code
+            item.state = (code == currentLang) ? .on : .off
+            langMenu.addItem(item)
+        }
+        let langItem = NSMenuItem(title: "Caption Language", action: nil, keyEquivalent: "")
+        langItem.submenu = langMenu
+        menu.addItem(langItem)
+
         // Mic device selector (submenu)
         if recorder.useMicrophone {
             let micMenu = NSMenu()
@@ -158,66 +181,191 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             do {
                 try await recorder.startRecording()
-                guard recorder.captionsEnabled else { return }
-
                 guard let recordingURL = recorder.currentRecordingURL() else {
-                    NSLog("[AppDelegate] no recording URL; skipping caption setup")
+                    NSLog("[AppDelegate] no recording URL; skipping caption / verbatim setup")
                     return
                 }
                 let sessionStart = Date()
                 let sessionId = UUID()
                 let mdURL = recordingURL.deletingPathExtension().appendingPathExtension("md")
 
-                let panel = CaptionPanel()
-                self.captionPanel = panel
-                panel.show()
+                // 1) Verbatim pipeline (always-on, soft-fail per Q5/Q6).
+                //    Failure here doesn't abort the recording — we just skip
+                //    .verbatim.md and surface a notification.
+                await self.startVerbatimPipeline(
+                    recordingURL: recordingURL,
+                    notesURL: mdURL,
+                    sessionStart: sessionStart,
+                    sessionId: sessionId
+                )
 
-                let buffer = TranscriptBuffer()
-                self.transcriptBuffer = buffer
-                let notes = NotesWriter(mdURL: mdURL, recordingURL: recordingURL,
-                                         startedAt: sessionStart, sessionId: sessionId)
-                self.notesWriter = notes
-
-                let lc = LiveCaptions()
-                self.liveCaptions = lc
-                lc.onCaption = { [weak panel, weak buffer, weak notes] ev in
-                    panel?.applyCaption(ev)
-                    let entry = TranscriptEntry(startSec: ev.startSec, endSec: ev.endSec, text: ev.text)
-                    buffer?.append(entry)
-                    try? notes?.appendTranscript(entry)
-                }
-                recorder.onPCMChunk = { samples, rate in
-                    lc.append(samples, sampleRate: rate)
-                }
-                do {
-                    try await lc.start(sessionStart: sessionStart)
-                } catch {
-                    NSLog("[AppDelegate] WhisperKit load failed: \(error)")
-                    panel.showOffline("captions unavailable — model load failed")
-                    return
+                // 2) Live captions branch (existing behavior, gated on toggle).
+                if recorder.captionsEnabled {
+                    self.startLiveCaptionsBranch(
+                        recordingURL: recordingURL,
+                        mdURL: mdURL,
+                        sessionStart: sessionStart,
+                        sessionId: sessionId
+                    )
                 }
 
-                let summary = SummaryClient(sessionId: sessionId, buffer: buffer, sessionStart: sessionStart)
-                self.summaryClient = summary
-                summary.onSummary = { [weak panel, weak notes] s in
-                    panel?.renderSummary(s)
-                    try? notes?.updateSummary(s)
+                // 3) Fan out PCM samples to whichever consumers exist.
+                //    This must happen AFTER both branches have been set up
+                //    so the closure captures the right state.
+                self.wireFanOut()
+
+                // 4) Captions need an explicit start() once the fan-out is in
+                //    place, since LiveCaptions.start() loads the WhisperKit
+                //    model asynchronously.
+                if let lc = self.liveCaptions {
+                    do {
+                        try await lc.start(sessionStart: sessionStart)
+                    } catch {
+                        NSLog("[AppDelegate] WhisperKit load failed: \(error)")
+                        self.captionPanel?.showOffline("captions unavailable — model load failed")
+                    }
                 }
-                summary.onOffline = { [weak panel] reason in
-                    panel?.showOffline(reason)
+
+                // 5) Summary client (only if captions branch is alive — it
+                //    consumes the captions transcript buffer).
+                if recorder.captionsEnabled, let buffer = self.transcriptBuffer {
+                    let summary = SummaryClient(sessionId: sessionId, buffer: buffer, sessionStart: sessionStart)
+                    self.summaryClient = summary
+                    summary.onSummary = { [weak self] s in
+                        self?.captionPanel?.renderSummary(s)
+                        try? self?.notesWriter?.updateSummary(s)
+                    }
+                    summary.onOffline = { [weak self] reason in
+                        self?.captionPanel?.showOffline(reason)
+                    }
+                    summary.start(intervalSec: 180)
                 }
-                summary.start(intervalSec: 180)
             } catch {
                 NSLog("Recording failed: \(error)")
             }
         }
     }
 
+    /// Spin up whisper-server + VerbatimTranscriber + VerbatimWriter. On any
+    /// failure, log + show a macOS notification and leave the trio nil so
+    /// the rest of the recording continues without verbatim.
+    @MainActor
+    private func startVerbatimPipeline(recordingURL: URL,
+                                       notesURL: URL?,
+                                       sessionStart: Date,
+                                       sessionId: UUID) async {
+        let language = recorder.captionLanguage
+        let server = WhisperServerProcess()
+        do {
+            try await server.start(language: language)
+        } catch {
+            NSLog("[AppDelegate] whisper-server start failed: \(error.localizedDescription)")
+            self.postVerbatimUnavailable(reason: error.localizedDescription)
+            return
+        }
+        self.whisperServer = server
+
+        // base path: <savedir>/Recording-YYYY-MM-DD-HHMMSS  (no extension)
+        let basePath = recordingURL.deletingPathExtension().path
+        let verbatimURL = URL(fileURLWithPath: basePath + ".verbatim.md")
+
+        let writer = VerbatimWriter(
+            verbatimURL: verbatimURL,
+            recordingURL: recordingURL,
+            notesURL: notesURL,
+            startedAt: sessionStart,
+            sessionId: sessionId,
+            config: VerbatimWriter.Config(
+                language: language,
+                engine: "whisper.cpp/ggml-large-v3-turbo",
+                algo: "LocalAgreement-2",
+                chunkWindowSec: 1.0,
+                trimWindowSec: 15.0
+            )
+        )
+        let transcriber = VerbatimTranscriber(server: server, writer: writer)
+        do {
+            try transcriber.start(sessionStart: sessionStart)
+        } catch {
+            NSLog("[AppDelegate] verbatim writer preamble failed: \(error)")
+            self.postVerbatimUnavailable(reason: "could not write \(verbatimURL.lastPathComponent)")
+            server.stop()
+            self.whisperServer = nil
+            return
+        }
+        self.verbatimWriter = writer
+        self.verbatimTranscriber = transcriber
+        NSLog("[AppDelegate] verbatim pipeline ready → \(verbatimURL.lastPathComponent)")
+    }
+
+    @MainActor
+    private func startLiveCaptionsBranch(recordingURL: URL,
+                                         mdURL: URL,
+                                         sessionStart: Date,
+                                         sessionId: UUID) {
+        let panel = CaptionPanel()
+        self.captionPanel = panel
+        panel.show()
+
+        let buffer = TranscriptBuffer()
+        self.transcriptBuffer = buffer
+        let notes = NotesWriter(mdURL: mdURL, recordingURL: recordingURL,
+                                startedAt: sessionStart, sessionId: sessionId)
+        self.notesWriter = notes
+
+        let lc = LiveCaptions()
+        self.liveCaptions = lc
+        lc.onCaption = { [weak panel, weak buffer, weak notes] ev in
+            panel?.applyCaption(ev)
+            let entry = TranscriptEntry(startSec: ev.startSec, endSec: ev.endSec, text: ev.text)
+            buffer?.append(entry)
+            try? notes?.appendTranscript(entry)
+        }
+    }
+
+    /// Connect AudioRecorder's PCM tap to whichever consumers are alive.
+    /// Captures live references so adding consumers later doesn't require
+    /// re-wiring (each consumer is checked at callback time via `self`).
+    @MainActor
+    private func wireFanOut() {
+        recorder.onPCMChunk = { [weak self] samples, rate in
+            guard let self else { return }
+            self.liveCaptions?.append(samples, sampleRate: rate)
+            self.verbatimTranscriber?.append(samples, sampleRate: rate)
+        }
+    }
+
+    private func postVerbatimUnavailable(reason: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "Verbatim transcript unavailable"
+        content.body = reason
+        content.sound = nil
+        let req = UNNotificationRequest(identifier: UUID().uuidString,
+                                        content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
+    }
+
     @objc private func stopRecording() {
         Task { @MainActor in
+            // Stop accepting audio first so neither pipeline gets new samples
+            // mid-shutdown.
+            self.recorder.onPCMChunk = nil
+
+            // Verbatim teardown — force-commit pending buffer (Q8: stop
+            // semantics), then kill the whisper-server subprocess. Done
+            // before captions/summary so the verbatim file is finalized
+            // even if something below throws.
+            await self.verbatimTranscriber?.flush()
+            self.verbatimTranscriber?.stop()
+            try? self.verbatimWriter?.setEnded(Date())
+            self.whisperServer?.stop()
+            self.verbatimTranscriber = nil
+            self.verbatimWriter = nil
+            self.whisperServer = nil
+
+            // Captions teardown.
             await self.liveCaptions?.flush()
             self.liveCaptions?.stop()
-            self.recorder.onPCMChunk = nil
             self.liveCaptions = nil
 
             self.summaryClient?.stop()
@@ -255,6 +403,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let id = sender.representedObject as? String {
             recorder.switchMicDevice(to: id)
             rebuildMenu()
+        }
+    }
+
+    @objc private func setCaptionLanguage(_ sender: NSMenuItem) {
+        guard let code = sender.representedObject as? String,
+              ["auto", "zh", "en"].contains(code) else { return }
+        recorder.captionLanguage = code
+        rebuildMenu()
+        // Note: doesn't affect a recording in progress — language is locked
+        // when whisper-server spawns. Next recording will pick up the change.
+    }
+
+    private static func languageLabel(for code: String) -> String {
+        switch code {
+        case "auto": return "Auto-detect"
+        case "zh":   return "Chinese (中文)"
+        case "en":   return "English"
+        default:     return code
         }
     }
 

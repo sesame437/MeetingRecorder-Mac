@@ -26,6 +26,12 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
     @Published var selectedMicID: String? {
         didSet { UserDefaults.standard.set(selectedMicID, forKey: "selectedMicID") }
     }
+    /// Caption / verbatim transcription language. One of "auto", "zh", "en".
+    /// Controls both the existing `Enable Live Captions` panel (future) and the
+    /// new verbatim transcription pipeline. Persisted across launches.
+    @Published var captionLanguage: String {
+        didSet { UserDefaults.standard.set(captionLanguage, forKey: "captionLanguage") }
+    }
 
     /// Fan-out of the post-mixed audio for live captions.
     /// Called from the SCStream audio queue (NOT main). The closure receives
@@ -61,6 +67,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         self.useMicrophone = UserDefaults.standard.object(forKey: "useMicrophone") as? Bool ?? true
         self.captionsEnabled = UserDefaults.standard.object(forKey: "captionsEnabled") as? Bool ?? false
         self.selectedMicID = UserDefaults.standard.string(forKey: "selectedMicID")
+        self.captionLanguage = UserDefaults.standard.string(forKey: "captionLanguage") ?? "auto"
         if let path = UserDefaults.standard.string(forKey: "saveDirectory") {
             self.saveDirectory = URL(fileURLWithPath: path)
         } else {
