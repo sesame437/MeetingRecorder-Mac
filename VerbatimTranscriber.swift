@@ -72,6 +72,14 @@ final class VerbatimTranscriber: @unchecked Sendable {
     /// transcribes so they don't pile up faster than whisper-server can
     /// serve them.
     private var inFlight: Bool = false
+    /// Watchdog state for the long-running whisper-server Metal-pipeline
+    /// deadlock. Each /inference request that fails (timeout / connection
+    /// drop / HTTP non-200) bumps `consecutiveFailures`; on the threshold
+    /// we kick off a server restart and gate `maybeTranscribe` until the
+    /// new server is ready.
+    private var consecutiveFailures: Int = 0
+    private let restartFailureThreshold: Int = 2
+    private var serverRestartInProgress: Bool = false
 
     private let httpSession: URLSession
 
@@ -90,8 +98,12 @@ final class VerbatimTranscriber: @unchecked Sendable {
         self.writer = writer
         self.language = language
         let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 30
-        cfg.timeoutIntervalForResource = 30
+        // 15 s timeout: a healthy whisper-server processes a 15 s WAV (our
+        // largest possible payload) in ~1-2 s on M-series, so 15 s is
+        // 7-10× headroom for legit inference and halves the watchdog's
+        // cliff-detection delay (was 30+30=60 s, now 15+15=30 s).
+        cfg.timeoutIntervalForRequest = 15
+        cfg.timeoutIntervalForResource = 15
         self.httpSession = URLSession(configuration: cfg)
     }
 
@@ -165,7 +177,7 @@ final class VerbatimTranscriber: @unchecked Sendable {
     // MARK: - Inference loop (runs on `queue`)
 
     private func maybeTranscribe() {
-        guard !inFlight, !stopped else { return }
+        guard !inFlight, !stopped, !serverRestartInProgress else { return }
         let bufferSec = Double(audioBuffer.count) / Double(Self.sampleRate)
         guard bufferSec >= minChunkSec else { return }
         // Snapshot under queue, then hop to detached Task — keeps the
@@ -180,11 +192,31 @@ final class VerbatimTranscriber: @unchecked Sendable {
     }
 
     private func runInference(samples: [Float], offsetSec: Double, isFinal: Bool) async {
+        var inferenceSucceeded = false
         defer {
+            // Updates run on the serial queue so consecutiveFailures /
+            // serverRestartInProgress are race-free with maybeTranscribe.
             queue.async { [weak self] in
-                self?.inFlight = false
-                // Allow the next iteration to pick up new buffered audio.
-                self?.maybeTranscribe()
+                guard let self else { return }
+                self.inFlight = false
+                if inferenceSucceeded {
+                    self.consecutiveFailures = 0
+                    self.maybeTranscribe()
+                    return
+                }
+                // Failure path: bump counter, possibly trigger restart.
+                self.consecutiveFailures += 1
+                if self.consecutiveFailures >= self.restartFailureThreshold,
+                   !self.serverRestartInProgress,
+                   !self.stopped {
+                    NSLog("verbatim: \(self.consecutiveFailures) consecutive inference failures → restarting whisper-server")
+                    self.serverRestartInProgress = true
+                    Task.detached { [weak self] in
+                        await self?.runServerRestart()
+                    }
+                    return  // skip maybeTranscribe; restart handler will call it
+                }
+                self.maybeTranscribe()
             }
         }
 
@@ -208,6 +240,7 @@ final class VerbatimTranscriber: @unchecked Sendable {
                 NSLog("verbatim: failed to parse verbose_json")
                 return
             }
+            inferenceSucceeded = true
             queue.async { [weak self] in
                 guard let self, !self.stopped else { return }
                 if isFinal {
@@ -218,6 +251,33 @@ final class VerbatimTranscriber: @unchecked Sendable {
             }
         } catch {
             NSLog("verbatim: inference error: \(error.localizedDescription)")
+        }
+    }
+
+    /// Tear down + re-spawn the whisper-server when the long-running
+    /// Metal pipeline has deadlocked. Runs on a detached Task (off the
+    /// serial queue) so the restart's await doesn't block sample
+    /// appends. On success we clear watchdog state; on failure we leave
+    /// `serverRestartInProgress` cleared too — the next inference will
+    /// retry against the (still-stuck) server, fail again, and loop
+    /// back here.
+    private func runServerRestart() async {
+        let success: Bool
+        do {
+            try await server.restart()
+            success = true
+            NSLog("verbatim: whisper-server restart OK on port \(server.port)")
+        } catch {
+            success = false
+            NSLog("verbatim: whisper-server restart failed: \(error.localizedDescription)")
+        }
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.serverRestartInProgress = false
+            // Reset counter so we don't immediately retrigger restart
+            // on the next failure; give the new server a fair chance.
+            if success { self.consecutiveFailures = 0 }
+            self.maybeTranscribe()
         }
     }
 

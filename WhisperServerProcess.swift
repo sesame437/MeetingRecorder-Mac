@@ -59,6 +59,12 @@ final class WhisperServerProcess: @unchecked Sendable {
     private var stderrPipe: Pipe?
     private var stdoutPipe: Pipe?
 
+    // Last successful start args, so `restart()` can re-spawn without the
+    // caller re-passing them. Set inside start().
+    private var lastModelPath: String = ""
+    private var lastBinaryPath: String = ""
+    private var lastLanguage: String = "auto"
+
     /// Final URL components for inference requests once started.
     var inferenceURL: URL? {
         guard port != 0 else { return nil }
@@ -83,6 +89,11 @@ final class WhisperServerProcess: @unchecked Sendable {
             throw StartError.modelNotFound(path: modelPath)
         }
 
+        // Stash for restart()
+        self.lastBinaryPath = binaryPath
+        self.lastModelPath = modelPath
+        self.lastLanguage = language
+
         let assignedPort = try Self.findFreeLoopbackPort(startingAt: 8137)
         self.port = assignedPort
 
@@ -93,6 +104,13 @@ final class WhisperServerProcess: @unchecked Sendable {
             "--host", "127.0.0.1",
             "--port", String(assignedPort),
             "--language", language,
+            // commit-5 mitigation: flash-attn (default true) is a known
+            // contributor to the long-running Metal pipeline deadlock that
+            // hits whisper.cpp around the 7-8 minute mark. Disabling it
+            // costs ~10-15% inference speed but avoids the cliff. The
+            // watchdog in VerbatimTranscriber will still restart us if
+            // the bug recurs.
+            "--no-flash-attn",
             // NOTE: --print-progress is a boolean toggle (default false).
             // Do not pass "false" as a value or whisper-server treats it as
             // a stray positional argument, prints help, and exits.
@@ -123,13 +141,22 @@ final class WhisperServerProcess: @unchecked Sendable {
         guard let proc = process else { return }
         if proc.isRunning {
             proc.terminate()
-            // Best-effort: give it 2s to exit cleanly, then SIGKILL.
+            // SIGTERM grace, then SIGKILL. Note: when whisper-server is
+            // GPU-deadlocked it does NOT respond to SIGTERM at all (signal
+            // handler can't run because the main thread is wedged in a
+            // Metal dispatch). The 2 s budget lets clean exits finish but
+            // we always escalate to SIGKILL for the deadlock case.
             let deadline = Date().addingTimeInterval(2.0)
             while proc.isRunning && Date() < deadline {
                 Thread.sleep(forTimeInterval: 0.05)
             }
             if proc.isRunning {
                 kill(proc.processIdentifier, SIGKILL)
+                // Reap so it doesn't linger as a zombie.
+                let killDeadline = Date().addingTimeInterval(1.0)
+                while proc.isRunning && Date() < killDeadline {
+                    Thread.sleep(forTimeInterval: 0.05)
+                }
             }
         }
         process = nil
@@ -137,6 +164,27 @@ final class WhisperServerProcess: @unchecked Sendable {
         stdoutPipe = nil
         port = 0
         NSLog("whisper-server: stopped")
+    }
+
+    /// Tear down the current subprocess and re-spawn with the same
+    /// parameters used in the most recent `start(...)` call. Used by the
+    /// VerbatimTranscriber watchdog when the Metal pipeline deadlock
+    /// recurs (HTTP keeps answering but /inference hangs forever).
+    /// Caller waits ~3-5 s for the new server to load the model and
+    /// answer the readiness probe.
+    func restart() async throws {
+        let binary = lastBinaryPath
+        let model = lastModelPath
+        let lang = lastLanguage
+        guard !binary.isEmpty, !model.isEmpty else {
+            throw StartError.spawnFailed(underlying: NSError(
+                domain: "WhisperServerProcess", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "restart() called before any start()"]
+            ))
+        }
+        NSLog("whisper-server: restarting (port \(port) → fresh)")
+        stop()
+        try await start(modelPath: model, binaryPath: binary, language: lang)
     }
 
     deinit { stop() }
