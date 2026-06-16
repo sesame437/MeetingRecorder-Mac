@@ -22,7 +22,6 @@ let package = Package(
                 "generate_icon.py",
                 "README.md",
                 "MeetingRecorder.app",
-                "MeetingRecorder-v2.7.0-dual-track.dmg",
                 "MeetingRecorder.dmg",
                 "docs",
             ],
@@ -34,6 +33,9 @@ let package = Package(
                 "CaptionPanel.swift",
                 "NotesWriter.swift",
                 "SummaryClient.swift",
+                "WhisperServerProcess.swift",
+                "VerbatimWriter.swift",
+                "VerbatimTranscriber.swift",
             ]
         )
     ]
