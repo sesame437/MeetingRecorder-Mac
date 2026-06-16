@@ -23,7 +23,6 @@ let package = Package(
                 "README.md",
                 "MeetingRecorder.app",
                 "MeetingRecorder.dmg",
-                "docs",
             ],
             sources: [
                 "MeetingRecorderApp.swift",

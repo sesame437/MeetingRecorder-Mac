@@ -27,10 +27,17 @@ enum SummaryError: Error {
 // MARK: - Env-backed config
 
 enum LiveSummaryConfig {
-    static var backendURL: URL {
-        let fallback = "https://your-backend.example.com"
-        let raw = ProcessInfo.processInfo.environment["LIVE_SUMMARY_URL"] ?? fallback
-        return URL(string: raw) ?? URL(string: fallback)!
+    /// Backend URL for the rolling-summary endpoint. **Required** via the
+    /// `LIVE_SUMMARY_URL` environment variable — there is no default.
+    /// If unset or unparseable, callers get nil and the summary feature
+    /// stays inert (recording + verbatim continue normally).
+    static var backendURL: URL? {
+        guard let raw = ProcessInfo.processInfo.environment["LIVE_SUMMARY_URL"],
+              !raw.isEmpty,
+              let url = URL(string: raw) else {
+            return nil
+        }
+        return url
     }
     static var apiKey: String? {
         ProcessInfo.processInfo.environment["LIVE_SUMMARY_API_KEY"]
@@ -58,12 +65,17 @@ final class SummaryClient {
     private var consecutiveFailures: Int = 0
     private let offlineThreshold: Int = 3
 
-    init(backendURL: URL = LiveSummaryConfig.backendURL,
-         apiKey: String? = LiveSummaryConfig.apiKey,
-         sessionId: UUID,
-         buffer: TranscriptBuffer,
-         sessionStart: Date) {
-        self.backendURL = backendURL
+    /// Failable: returns nil when LIVE_SUMMARY_URL is unset / empty / invalid,
+    /// so the caller can skip wiring up the summary feature instead of
+    /// hitting a dead URL on every tick. Recording + verbatim are
+    /// independent and continue regardless.
+    init?(backendURL: URL? = LiveSummaryConfig.backendURL,
+          apiKey: String? = LiveSummaryConfig.apiKey,
+          sessionId: UUID,
+          buffer: TranscriptBuffer,
+          sessionStart: Date) {
+        guard let url = backendURL else { return nil }
+        self.backendURL = url
         self.apiKey = apiKey
         self.sessionId = sessionId
         self.buffer = buffer

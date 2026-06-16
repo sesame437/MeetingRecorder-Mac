@@ -69,7 +69,7 @@ open MeetingRecorder.app
 
 Grant **Screen Recording** and **Microphone** permission when prompted.
 
-To enable the rolling-summary feature, export the backend URL before launch:
+To enable the rolling-summary feature, **you must export `LIVE_SUMMARY_URL` pointing at your own backend before launch** — there is no default. Without it, recording + captions + verbatim still work, only the summary feature stays inert (the floating panel shows `summary unavailable — set LIVE_SUMMARY_URL`).
 
 ```bash
 export LIVE_SUMMARY_URL="https://your-backend.example.com"
@@ -77,7 +77,7 @@ export LIVE_SUMMARY_API_KEY="<optional>"        # only if backend requires it
 open MeetingRecorder.app
 ```
 
-The backend must expose `POST /api/live-summary` matching the contract below.
+The backend must expose `POST /api/live-summary` matching the contract below. A reference implementation lives at [sesame437/smart-meeting-notes](https://github.com/sesame437/smart-meeting-notes) (Express.js + Bedrock + FunASR).
 
 ## Backend contract
 

@@ -298,10 +298,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                 }
 
-                // 5) Summary client (only if captions branch is alive — it
-                //    consumes the captions transcript buffer).
-                if recorder.captionsEnabled, let buffer = self.transcriptBuffer {
-                    let summary = SummaryClient(sessionId: sessionId, buffer: buffer, sessionStart: sessionStart)
+                // 5) Summary client. Init is failable: returns nil when
+                //    LIVE_SUMMARY_URL is unset, so we just skip the
+                //    feature instead of pointing the timer at thin air.
+                //    Captions + verbatim continue regardless.
+                if recorder.captionsEnabled,
+                   let buffer = self.transcriptBuffer,
+                   let summary = SummaryClient(sessionId: sessionId, buffer: buffer, sessionStart: sessionStart) {
                     self.summaryClient = summary
                     summary.onSummary = { [weak self] s in
                         self?.captionPanel?.renderSummary(s)
@@ -311,6 +314,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         self?.captionPanel?.showOffline(reason)
                     }
                     summary.start(intervalSec: 180)
+                } else if recorder.captionsEnabled {
+                    self.captionPanel?.showOffline("summary unavailable — set LIVE_SUMMARY_URL")
                 }
             } catch {
                 NSLog("Recording failed: \(error)")

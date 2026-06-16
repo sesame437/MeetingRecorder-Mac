@@ -15,3 +15,9 @@ MeetingRecorder-v2.7.0.dmg
 
 # WhisperKit model cache (just in case it lands inside the project dir)
 WhisperKit/
+
+# Internal design docs / planning notes — not for the public repo.
+docs/
+CLAUDE.md
+GEMINI.md
+AGENTS.md
