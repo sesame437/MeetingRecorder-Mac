@@ -167,7 +167,11 @@ final class VerbatimTranscriber: @unchecked Sendable {
             await runInference(samples: samples, offsetSec: offsetSec, isFinal: true)
         }
 
-        // Drain anything still in lineBuffer.
+        // Drain anything still in lineBuffer + write a sentinel so
+        // downstream readers can spot "transcription ended cleanly here"
+        // visually (frontmatter `verbatim_ended_at` says it precisely,
+        // the sentinel is the human-readable equivalent at the bottom of
+        // the file).
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
                 guard let self else { cont.resume(); return }
@@ -177,6 +181,8 @@ final class VerbatimTranscriber: @unchecked Sendable {
                     self.lineBuffer = ""
                     self.lineStartSec = nil
                 }
+                let endSec = max(0, Date().timeIntervalSince(self.sessionStart))
+                try? self.writer.appendLine("— end of transcript —", at: endSec)
                 cont.resume()
             }
         }
