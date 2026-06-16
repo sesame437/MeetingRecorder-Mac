@@ -217,46 +217,85 @@ final class VerbatimTranscriber: @unchecked Sendable {
 
     // MARK: - LocalAgreement-2 (runs on `queue`)
 
+    /// LocalAgreement-2: commit the longest CHARACTER prefix that two
+    /// consecutive iterations agree on. We can't compare segment-by-segment
+    /// because Whisper re-segments the same content differently between
+    /// runs ("we are in the era" / "of AI" vs "we are in" / "the era of
+    /// AI") — that bug ate ~75% of speech in commit 2 testing.
     private func applyAgreement(newSegments: [Segment], offsetSec: Double) {
-        // The samples we sent might pre-date current buffer head if
-        // append() trimmed concurrently; but since we set inFlight before
-        // sending, applyAgreement runs with offsetSec equal to the head
-        // we sent — `lastSegments` are also relative to that head.
-        let common = Self.longestCommonPrefix(prev: lastSegments, current: newSegments)
+        let prevText = Self.joinSegments(lastSegments)
+        let currentText = Self.joinSegments(newSegments)
+        let prefixLen = Self.longestCommonPrefixLength(prevText, currentText)
 
-        var lastEndRelative: Double = 0
-        for seg in common {
-            commitText(seg.text, atSec: offsetSec + seg.start)
-            lastEndRelative = seg.end
-        }
-
-        // Trim audio buffer past the last committed segment.
-        if !common.isEmpty {
-            let trimSamples = Int((lastEndRelative * Double(Self.sampleRate)).rounded())
-            let safeTrim = min(max(trimSamples, 0), audioBuffer.count)
-            if safeTrim > 0 {
-                audioBuffer.removeFirst(safeTrim)
-                audioBufferOffsetSec += Double(safeTrim) / Double(Self.sampleRate)
+        // Walk current segments, committing those FULLY contained within
+        // the agreed prefix. Partial-segment overlap is left for the next
+        // iteration to firm up — committing a half-segment loses Whisper's
+        // segment-level timing/punctuation cues.
+        var charsUsed = 0
+        var lastCommittedEnd: Double = 0
+        var first = true
+        for seg in newSegments {
+            let txt = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if txt.isEmpty { continue }
+            let sep = first ? 0 : 1   // single-space separator between segments
+            let need = charsUsed + sep + txt.count
+            if need <= prefixLen {
+                commitText(txt, atSec: offsetSec + seg.start)
+                lastCommittedEnd = seg.end
+                charsUsed = need
+                first = false
+            } else {
+                break
             }
         }
 
-        // Hard cap. If the agreement isn't progressing (e.g., language
-        // detection thrashing), force-trim from the head so we don't
-        // grow without bound.
-        let maxSamples = Int(trimWindowSec * Double(Self.sampleRate))
-        if audioBuffer.count > maxSamples {
-            let excess = audioBuffer.count - maxSamples
-            audioBuffer.removeFirst(excess)
-            audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
+        trimAudioBuffer(toRelative: lastCommittedEnd, baseOffset: offsetSec)
+
+        // Hard cap with force-commit: if the buffer is STILL too long
+        // (agreement not converging), commit older segments unconditionally
+        // before trimming. Better to write slightly-uncertain text than
+        // silently lose audio (the commit-2 4:17 / 39-second-gap symptom).
+        let bufferSec = Double(audioBuffer.count) / Double(Self.sampleRate)
+        if bufferSec > trimWindowSec {
+            let forceCommitSec = bufferSec - trimWindowSec
+            let currentHead = audioBufferOffsetSec
+            for seg in newSegments {
+                let segEndAbs = offsetSec + seg.end
+                if segEndAbs <= currentHead { continue }   // already committed
+                let segEndRelativeToHead = segEndAbs - currentHead
+                if segEndRelativeToHead <= forceCommitSec {
+                    let segText = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !segText.isEmpty {
+                        commitText(segText, atSec: offsetSec + seg.start)
+                    }
+                    trimAudioBuffer(toRelative: seg.end, baseOffset: offsetSec)
+                } else {
+                    break
+                }
+            }
+            // Last-resort brutal head trim if force-commit walk found
+            // nothing (e.g., whisper returned empty segments) — bound the
+            // buffer at all costs.
+            let postForceSec = Double(audioBuffer.count) / Double(Self.sampleRate)
+            if postForceSec > trimWindowSec {
+                let excess = audioBuffer.count - Int(trimWindowSec * Double(Self.sampleRate))
+                if excess > 0 {
+                    audioBuffer.removeFirst(excess)
+                    audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
+                }
+            }
         }
 
-        // Re-zero the unconfirmed-tail segments against the NEW buffer
-        // head, so next round's prefix comparison lines up.
-        let remaining = newSegments.dropFirst(common.count)
-        lastSegments = remaining.map {
-            Segment(text: $0.text,
-                    start: $0.start - lastEndRelative,
-                    end: $0.end - lastEndRelative)
+        // Rebase the surviving segments against the new buffer head so
+        // next iteration's prefix-comparison aligns.
+        let currentHeadAbs = audioBufferOffsetSec
+        lastSegments = newSegments.compactMap { seg in
+            let absEnd = offsetSec + seg.end
+            guard absEnd > currentHeadAbs else { return nil }
+            let absStart = offsetSec + seg.start
+            return Segment(text: seg.text,
+                           start: absStart - currentHeadAbs,
+                           end: absEnd - currentHeadAbs)
         }
     }
 
@@ -266,19 +305,39 @@ final class VerbatimTranscriber: @unchecked Sendable {
         }
     }
 
-    private static func longestCommonPrefix(prev: [Segment], current: [Segment]) -> [Segment] {
-        var result: [Segment] = []
-        let limit = min(prev.count, current.count)
-        for i in 0..<limit {
-            let a = prev[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let b = current[i].text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !a.isEmpty && a == b {
-                result.append(current[i])
-            } else {
-                break
-            }
+    /// Trim the audio buffer up to `timeRelative` seconds past `baseOffset`.
+    /// Idempotent and safe if some other call has already trimmed past
+    /// that point.
+    private func trimAudioBuffer(toRelative timeRelative: Double, baseOffset: Double) {
+        guard timeRelative > 0 else { return }
+        let absoluteCutoff = baseOffset + timeRelative
+        let trimSec = absoluteCutoff - audioBufferOffsetSec
+        guard trimSec > 0 else { return }
+        let trimSamples = Int((trimSec * Double(Self.sampleRate)).rounded())
+        let safe = min(max(trimSamples, 0), audioBuffer.count)
+        if safe > 0 {
+            audioBuffer.removeFirst(safe)
+            audioBufferOffsetSec += Double(safe) / Double(Self.sampleRate)
         }
-        return result
+    }
+
+    private static func joinSegments(_ segments: [Segment]) -> String {
+        return segments
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    /// Longest common prefix at the Swift `Character` level (grapheme
+    /// clusters), so CJK is counted by visible character not byte.
+    private static func longestCommonPrefixLength(_ a: String, _ b: String) -> Int {
+        var ai = a.makeIterator()
+        var bi = b.makeIterator()
+        var n = 0
+        while let ac = ai.next(), let bc = bi.next(), ac == bc {
+            n += 1
+        }
+        return n
     }
 
     // MARK: - Line builder (runs on `queue`)
