@@ -109,18 +109,28 @@ final class VerbatimTranscriber: @unchecked Sendable {
 
     // MARK: - Public surface (called from MainActor / audio queue)
 
-    /// Mark t=0 of the session and lay down the .verbatim.md preamble.
-    func start(sessionStart: Date) throws {
+    /// Bind the transcriber to a session start (the mp4's t=0) and lay
+    /// down the .verbatim.md preamble. `initialOffsetSec` is the offset
+    /// of the first PCM sample we'll receive measured from `sessionStart`
+    /// — for the normal "verbatim was enabled before pressing Record"
+    /// path that's 0; for the "toggled verbatim ON two minutes into
+    /// recording" path it's `Date().timeIntervalSince(sessionStart)` so
+    /// that committed timestamps in .verbatim.md still align with the
+    /// mp4 timeline (a user grepping the file at minute 2:15 finds
+    /// `[00:02:15]`, not `[00:00:00]`).
+    func start(sessionStart: Date, initialOffsetSec: Double = 0) throws {
         try writer.writePreamble()
         queue.sync {
             self.sessionStart = sessionStart
             self.audioBuffer.removeAll(keepingCapacity: true)
-            self.audioBufferOffsetSec = 0
+            self.audioBufferOffsetSec = initialOffsetSec
             self.lastSegments.removeAll()
             self.lineBuffer = ""
             self.lineStartSec = nil
             self.stopped = false
             self.inFlight = false
+            self.consecutiveFailures = 0
+            self.serverRestartInProgress = false
         }
     }
 

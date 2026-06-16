@@ -18,6 +18,14 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     @Published var captionsEnabled: Bool {
         didSet { UserDefaults.standard.set(captionsEnabled, forKey: "captionsEnabled") }
     }
+    /// User-controlled toggle for the verbatim transcription pipeline.
+    /// Default false — the feature is opt-in. When toggled mid-recording,
+    /// AppDelegate spins up (or tears down) the whisper-server + writer
+    /// live, with a state machine to gate the transition (see
+    /// `VerbatimPipelineState`).
+    @Published var verbatimEnabled: Bool {
+        didSet { UserDefaults.standard.set(verbatimEnabled, forKey: "verbatimEnabled") }
+    }
     @Published var saveDirectory: URL {
         didSet { UserDefaults.standard.set(saveDirectory.path, forKey: "saveDirectory") }
     }
@@ -74,6 +82,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     override init() {
         self.useMicrophone = UserDefaults.standard.object(forKey: "useMicrophone") as? Bool ?? true
         self.captionsEnabled = UserDefaults.standard.object(forKey: "captionsEnabled") as? Bool ?? false
+        self.verbatimEnabled = UserDefaults.standard.object(forKey: "verbatimEnabled") as? Bool ?? false
         self.selectedMicID = UserDefaults.standard.string(forKey: "selectedMicID")
         self.captionLanguage = UserDefaults.standard.string(forKey: "captionLanguage") ?? "auto"
         if let path = UserDefaults.standard.string(forKey: "saveDirectory") {

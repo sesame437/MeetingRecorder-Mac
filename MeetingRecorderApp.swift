@@ -3,6 +3,17 @@ import Combine
 import AVFoundation
 import UserNotifications
 
+/// Lifecycle of the verbatim transcription pipeline within a single
+/// recording session. Independent of `recorder.verbatimEnabled`, which is
+/// the user's *intent*; this enum is the *runtime reality*.
+enum VerbatimPipelineState {
+    case idle               // not running (recording off, or recording on with toggle off)
+    case starting           // whisper-server spawn / writer init in progress
+    case transcribing       // pipeline live
+    case failed(String)     // spawn failed; click toggle again to retry
+    case stopping           // tear-down in progress
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let recorder = AudioRecorder()
@@ -18,6 +29,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var whisperServer: WhisperServerProcess?
     private var verbatimWriter: VerbatimWriter?
     private var verbatimTranscriber: VerbatimTranscriber?
+    private var verbatimPipelineState: VerbatimPipelineState = .idle
+    // Stashed session info so toggleVerbatim can build a writer with the
+    // correct `started_at` (mp4 origin) when verbatim is enabled mid-record.
+    private var recordingSessionStart: Date?
+    private var recordingSessionId: UUID?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -147,22 +163,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         capToggle.state = recorder.captionsEnabled ? .on : .off
         menu.addItem(capToggle)
 
-        // Caption / verbatim language selector. Drives whisper-server
-        // --language flag and the .verbatim.md frontmatter "language:" field.
-        let langMenu = NSMenu()
-        let currentLang = recorder.captionLanguage
-        for code in ["auto", "zh", "en"] {
-            let item = NSMenuItem(title: Self.languageLabel(for: code),
-                                  action: #selector(setCaptionLanguage(_:)),
-                                  keyEquivalent: "")
-            item.target = self
-            item.representedObject = code
-            item.state = (code == currentLang) ? .on : .off
-            langMenu.addItem(item)
+        // Verbatim transcript toggle — the menu's text reflects both the
+        // user's intent (verbatimEnabled) and the runtime state of the
+        // pipeline (verbatimPipelineState). Disabled while transitioning
+        // so rapid double-clicks can't race the spawn / teardown.
+        let (verbatimTitle, verbatimEnabled) = self.verbatimMenuItemDisplay()
+        let verbatimToggle = NSMenuItem(title: verbatimTitle,
+                                        action: #selector(toggleVerbatim),
+                                        keyEquivalent: "")
+        verbatimToggle.target = self
+        verbatimToggle.state = recorder.verbatimEnabled ? .on : .off
+        verbatimToggle.isEnabled = verbatimEnabled
+        menu.addItem(verbatimToggle)
+
+        // Caption Language submenu — only meaningful when verbatim is
+        // enabled (LiveCaptions still uses small.en hard-coded). Hidden
+        // when verbatim is off to reduce menu noise.
+        if recorder.verbatimEnabled {
+            let langMenu = NSMenu()
+            let currentLang = recorder.captionLanguage
+            for code in ["auto", "zh", "en"] {
+                let item = NSMenuItem(title: Self.languageLabel(for: code),
+                                      action: #selector(setCaptionLanguage(_:)),
+                                      keyEquivalent: "")
+                item.target = self
+                item.representedObject = code
+                item.state = (code == currentLang) ? .on : .off
+                langMenu.addItem(item)
+            }
+            let langItem = NSMenuItem(title: "Caption Language", action: nil, keyEquivalent: "")
+            langItem.submenu = langMenu
+            menu.addItem(langItem)
         }
-        let langItem = NSMenuItem(title: "Caption Language", action: nil, keyEquivalent: "")
-        langItem.submenu = langMenu
-        menu.addItem(langItem)
 
         // Mic device selector (submenu)
         if recorder.useMicrophone {
@@ -222,15 +254,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 let sessionId = UUID()
                 let mdURL = recordingURL.deletingPathExtension().appendingPathExtension("md")
 
-                // 1) Verbatim pipeline (always-on, soft-fail per Q5/Q6).
-                //    Failure here doesn't abort the recording — we just skip
-                //    .verbatim.md and surface a notification.
-                await self.startVerbatimPipeline(
-                    recordingURL: recordingURL,
-                    notesURL: mdURL,
-                    sessionStart: sessionStart,
-                    sessionId: sessionId
-                )
+                // Stash session info so a mid-recording verbatim toggle ON
+                // can build a writer with the correct mp4-anchored
+                // `started_at` and reuse the same session_id / notes URL.
+                self.recordingSessionStart = sessionStart
+                self.recordingSessionId = sessionId
+
+                // 1) Verbatim pipeline — only if user has the toggle on.
+                //    Failure here doesn't abort the recording (soft-fail).
+                if recorder.verbatimEnabled {
+                    await self.startVerbatimPipeline(
+                        recordingURL: recordingURL,
+                        notesURL: mdURL,
+                        sessionStart: sessionStart,
+                        sessionId: sessionId
+                    )
+                }
 
                 // 2) Live captions branch (existing behavior, gated on toggle).
                 if recorder.captionsEnabled {
@@ -242,9 +281,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }
 
-                // 3) Fan out PCM samples to whichever consumers exist.
-                //    This must happen AFTER both branches have been set up
-                //    so the closure captures the right state.
+                // 3) Fan out PCM samples. Done unconditionally so a
+                //    mid-recording verbatim toggle ON can attach without
+                //    re-wiring; the closure null-checks each consumer.
                 self.wireFanOut()
 
                 // 4) Captions need an explicit start() once the fan-out is in
@@ -279,21 +318,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Spin up whisper-server + VerbatimTranscriber + VerbatimWriter. On any
-    /// failure, log + show a macOS notification and leave the trio nil so
-    /// the rest of the recording continues without verbatim.
+    /// Spin up whisper-server + VerbatimTranscriber + VerbatimWriter. Used
+    /// both at recording start (when `verbatimEnabled` is on) and from
+    /// `toggleVerbatim` mid-record. Updates `verbatimPipelineState` so the
+    /// menu reflects starting → transcribing or starting → failed.
+    /// Caller is responsible for setting state to `.starting` and calling
+    /// `rebuildMenu()` BEFORE invoking this; this function transitions to
+    /// `.transcribing` or `.failed(...)` on completion.
     @MainActor
     private func startVerbatimPipeline(recordingURL: URL,
                                        notesURL: URL?,
                                        sessionStart: Date,
                                        sessionId: UUID) async {
         let language = recorder.captionLanguage
+        // verbatim_started_at is "now" — this is when transcription
+        // actually began, possibly long after the recording started.
+        let verbatimStartedAt = Date()
+        let initialOffsetSec = max(0, verbatimStartedAt.timeIntervalSince(sessionStart))
+
         let server = WhisperServerProcess()
         do {
             try await server.start(language: language)
         } catch {
             NSLog("[AppDelegate] whisper-server start failed: \(error.localizedDescription)")
             self.postVerbatimUnavailable(reason: error.localizedDescription)
+            self.verbatimPipelineState = .failed(error.localizedDescription)
+            self.rebuildMenu()
             return
         }
         self.whisperServer = server
@@ -307,6 +357,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             recordingURL: recordingURL,
             notesURL: notesURL,
             startedAt: sessionStart,
+            verbatimStartedAt: verbatimStartedAt,
             sessionId: sessionId,
             config: VerbatimWriter.Config(
                 language: language,
@@ -318,17 +369,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let transcriber = VerbatimTranscriber(server: server, writer: writer, language: language)
         do {
-            try transcriber.start(sessionStart: sessionStart)
+            try transcriber.start(sessionStart: sessionStart, initialOffsetSec: initialOffsetSec)
         } catch {
             NSLog("[AppDelegate] verbatim writer preamble failed: \(error)")
             self.postVerbatimUnavailable(reason: "could not write \(verbatimURL.lastPathComponent)")
             server.stop()
             self.whisperServer = nil
+            self.verbatimPipelineState = .failed("could not write \(verbatimURL.lastPathComponent)")
+            self.rebuildMenu()
             return
         }
         self.verbatimWriter = writer
         self.verbatimTranscriber = transcriber
-        NSLog("[AppDelegate] verbatim pipeline ready → \(verbatimURL.lastPathComponent)")
+        self.verbatimPipelineState = .transcribing
+        self.rebuildMenu()
+        NSLog("[AppDelegate] verbatim pipeline ready → \(verbatimURL.lastPathComponent) (offset=\(initialOffsetSec)s)")
+    }
+
+    /// Idempotent verbatim teardown — used both by stopRecording (full
+    /// session end) and by toggleVerbatim OFF (mid-record disable). Safe
+    /// to call when no pipeline is active. Final force-commit of any
+    /// unconfirmed audio happens here per the Stop-semantics decision.
+    @MainActor
+    private func tearDownVerbatim(stampVerbatimEnded: Bool) async {
+        // Snapshot the live trio so we can null them out before the
+        // awaits — prevents duplicate teardown if stopRecording races
+        // with toggle OFF.
+        let transcriber = self.verbatimTranscriber
+        let writer = self.verbatimWriter
+        let server = self.whisperServer
+        self.verbatimTranscriber = nil
+        self.verbatimWriter = nil
+        self.whisperServer = nil
+
+        guard transcriber != nil || writer != nil || server != nil else { return }
+
+        await transcriber?.flush()
+        transcriber?.stop()
+        if stampVerbatimEnded {
+            try? writer?.setVerbatimEnded(Date())
+        }
+        server?.stop()
     }
 
     @MainActor
@@ -384,17 +465,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // mid-shutdown.
             self.recorder.onPCMChunk = nil
 
-            // Verbatim teardown — force-commit pending buffer (Q8: stop
-            // semantics), then kill the whisper-server subprocess. Done
-            // before captions/summary so the verbatim file is finalized
-            // even if something below throws.
-            await self.verbatimTranscriber?.flush()
-            self.verbatimTranscriber?.stop()
+            // Verbatim teardown — force-commit pending buffer (stop
+            // semantics), then kill whisper-server. Stamp ended_at on
+            // the writer if it's still alive, before tearing it down.
+            // `setEnded` mirrors itself into verbatim_ended_at when that
+            // hasn't already been stamped (the toggle-OFF-mid-record
+            // case stamped it earlier).
             try? self.verbatimWriter?.setEnded(Date())
-            self.whisperServer?.stop()
-            self.verbatimTranscriber = nil
-            self.verbatimWriter = nil
-            self.whisperServer = nil
+            await self.tearDownVerbatim(stampVerbatimEnded: false)
+            self.verbatimPipelineState = .idle
 
             // Captions teardown.
             await self.liveCaptions?.flush()
@@ -418,6 +497,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             self.transcriptBuffer = nil
             self.captionPanel?.hide()
             self.captionPanel = nil
+            self.recordingSessionStart = nil
+            self.recordingSessionId = nil
             await recorder.stopRecording()
         }
     }
@@ -430,6 +511,79 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func toggleCaptions() {
         recorder.captionsEnabled.toggle()
         rebuildMenu()
+    }
+
+    @objc private func toggleVerbatim() {
+        // Defensive gate — menu item is disabled during transitions, but
+        // accept-and-ignore in case of timing edge cases.
+        switch verbatimPipelineState {
+        case .starting, .stopping: return
+        default: break
+        }
+
+        // Failed-state click means "retry" — intent is already ON, just
+        // re-spawn the pipeline. Don't flip verbatimEnabled.
+        if case .failed = verbatimPipelineState {
+            guard recorder.isRecording,
+                  let recordingURL = recorder.currentRecordingURL(),
+                  let sessionStart = recordingSessionStart,
+                  let sessionId = recordingSessionId else {
+                // Recording stopped between failure and retry — drop to idle.
+                verbatimPipelineState = .idle
+                rebuildMenu()
+                return
+            }
+            let mdURL = recordingURL.deletingPathExtension().appendingPathExtension("md")
+            verbatimPipelineState = .starting
+            rebuildMenu()
+            Task { @MainActor in
+                await self.startVerbatimPipeline(
+                    recordingURL: recordingURL,
+                    notesURL: mdURL,
+                    sessionStart: sessionStart,
+                    sessionId: sessionId
+                )
+            }
+            return
+        }
+
+        // Regular toggle: flip user intent (UserDefaults persists immediately).
+        let nowEnabled = !recorder.verbatimEnabled
+        recorder.verbatimEnabled = nowEnabled
+
+        // Not recording → just persist intent and rebuild.
+        guard recorder.isRecording,
+              let recordingURL = recorder.currentRecordingURL(),
+              let sessionStart = recordingSessionStart,
+              let sessionId = recordingSessionId else {
+            rebuildMenu()
+            return
+        }
+        let mdURL = recordingURL.deletingPathExtension().appendingPathExtension("md")
+
+        if nowEnabled {
+            // Mid-record toggle ON: spawn pipeline.
+            verbatimPipelineState = .starting
+            rebuildMenu()
+            Task { @MainActor in
+                await self.startVerbatimPipeline(
+                    recordingURL: recordingURL,
+                    notesURL: mdURL,
+                    sessionStart: sessionStart,
+                    sessionId: sessionId
+                )
+                // startVerbatimPipeline already updated state + rebuilt menu.
+            }
+        } else {
+            // Mid-record toggle OFF: tear down pipeline, recording continues.
+            verbatimPipelineState = .stopping
+            rebuildMenu()
+            Task { @MainActor in
+                await self.tearDownVerbatim(stampVerbatimEnded: true)
+                self.verbatimPipelineState = .idle
+                self.rebuildMenu()
+            }
+        }
     }
 
     @objc private func selectMic(_ sender: NSMenuItem) {
@@ -446,6 +600,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildMenu()
         // Note: doesn't affect a recording in progress — language is locked
         // when whisper-server spawns. Next recording will pick up the change.
+    }
+
+    /// Compute the label + click-enabled state for the verbatim menu
+    /// item from the cross-product of `verbatimEnabled` (intent) and
+    /// `verbatimPipelineState` (runtime).
+    private func verbatimMenuItemDisplay() -> (title: String, enabled: Bool) {
+        let base = "Enable Verbatim Transcript"
+        let intent = recorder.verbatimEnabled
+        switch verbatimPipelineState {
+        case .idle:
+            return (intent ? "\(base) ✓" : base, true)
+        case .starting:
+            return ("\(base) ✓ (starting…)", false)
+        case .transcribing:
+            return ("\(base) ✓ (transcribing)", true)
+        case .failed:
+            return ("\(base) ✓ ⚠ (unavailable — click to retry)", true)
+        case .stopping:
+            return ("\(base) (stopping…)", false)
+        }
     }
 
     private static func languageLabel(for code: String) -> String {
