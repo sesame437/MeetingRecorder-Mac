@@ -9,7 +9,7 @@ import UserNotifications
 // main queue (the @Published ones) or guarded by `micBufferLock`. Crossing
 // queue boundaries via Timer / DispatchQueue.main.async would otherwise trip
 // Swift 6 strict-concurrency warnings on every `self` capture.
-class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
+class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     @Published var isRecording = false
     @Published var elapsedTime: TimeInterval = 0
     @Published var useMicrophone: Bool {
@@ -38,6 +38,14 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
     /// Float32 mono samples downsampled to 16 kHz along with that sample rate.
     /// Nil by default; AppDelegate wires this up when captions are enabled.
     var onPCMChunk: (([Float], Double) -> Void)?
+
+    /// Fired on main when the underlying SCStream stops with an error
+    /// (system audio capture got interrupted by macOS — display lock,
+    /// permission re-prompt, audio HAL re-route, etc.). AppDelegate uses
+    /// this to surface a notification and tear down the recording, so we
+    /// don't silently end up with a half-length mp4 like Daisy's 4:17
+    /// cutoff during commit 1 testing.
+    var onStreamInterrupted: ((Error) -> Void)?
 
     private var stream: SCStream?
     private var assetWriter: AVAssetWriter?
@@ -141,7 +149,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-        let scStream = SCStream(filter: filter, configuration: config, delegate: nil)
+        let scStream = SCStream(filter: filter, configuration: config, delegate: self)
         try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "sys-audio"))
         try await scStream.startCapture()
         self.stream = scStream
@@ -319,6 +327,20 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, AVCaptureAudioD
         session.startRunning()
         self.captureSession = session
         NSLog("recorder: mic capture started")
+    }
+
+    // MARK: - SCStreamDelegate (interruption / error)
+
+    /// Called by ScreenCaptureKit on its own queue when our SCStream stops
+    /// with an error — typically a macOS-side interruption (display lock,
+    /// permission revoked, audio HAL re-route, the system bumping us off
+    /// the capture pipeline). Without this hook the stream just goes
+    /// silent and our recording quietly ends up truncated.
+    nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        NSLog("recorder: SCStream stopped with error: \(error.localizedDescription)")
+        DispatchQueue.main.async { [weak self] in
+            self?.onStreamInterrupted?(error)
+        }
     }
 
     // MARK: - SCStreamOutput (system audio) — mix mic in here

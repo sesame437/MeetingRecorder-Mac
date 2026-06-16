@@ -21,6 +21,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Request notification permission up-front. Without this, the
+        // soft-fail path's `postVerbatimUnavailable` is silently dropped
+        // by macOS — the user has no idea verbatim died (this exact
+        // pitfall hit Daisy during commit 1 testing).
+        UNUserNotificationCenter.current().requestAuthorization(
+            options: [.alert, .sound]
+        ) { granted, error in
+            if let error = error {
+                NSLog("[AppDelegate] notification auth error: \(error)")
+            } else if !granted {
+                NSLog("[AppDelegate] notification auth denied — soft-fails will be silent")
+            }
+        }
         // Resolve mic via the fallback chain before drawing the menu, so a
         // stale selectedMicID (e.g., headphones unplugged since last launch)
         // doesn't leave the submenu with nothing ticked.
@@ -55,6 +68,26 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             recorder.switchMicDevice(to: uid, manual: false)
             rebuildMenu()
         }
+
+        // SCStream interruption: macOS killed our system-audio capture
+        // (display lock, perm re-prompt, etc.). Notify the user and run
+        // the normal stop path so the mp4 / .verbatim.md / NotesWriter
+        // get finalized cleanly.
+        recorder.onStreamInterrupted = { [weak self] error in
+            guard let self else { return }
+            self.postStreamInterruptedNotice(error: error)
+            self.stopRecording()
+        }
+    }
+
+    private func postStreamInterruptedNotice(error: Error) {
+        let content = UNMutableNotificationContent()
+        content.title = "Recording stopped — system audio capture interrupted"
+        content.body = "macOS interrupted the screen-audio stream (\(error.localizedDescription)). Your recording was finalized at the moment of interruption."
+        content.sound = .default
+        let req = UNNotificationRequest(identifier: UUID().uuidString,
+                                        content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(req)
     }
 
     private func updateIcon() {
@@ -283,7 +316,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 trimWindowSec: 15.0
             )
         )
-        let transcriber = VerbatimTranscriber(server: server, writer: writer)
+        let transcriber = VerbatimTranscriber(server: server, writer: writer, language: language)
         do {
             try transcriber.start(sessionStart: sessionStart)
         } catch {
