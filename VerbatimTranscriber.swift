@@ -25,9 +25,15 @@ import Foundation
 /// few seconds of speech don't get dropped.
 final class VerbatimTranscriber: @unchecked Sendable {
 
-    // MARK: - Tuning (from Q2/Q3 decisions)
+    // MARK: - Tuning (from Q2/Q3 decisions + commit-4 quality fix)
     private let minChunkSec: Double = 1.0           // run inference every ≥1s of new audio
-    private let trimWindowSec: Double = 15.0        // hard cap on unconfirmed buffer
+    private let trimWindowSec: Double = 15.0        // last-resort buffer cap
+    /// Trailing audio that a segment needs behind it to be considered
+    /// "stable enough" for force-commit (Option B). 5 s gives whisper
+    /// enough lookahead context to have produced final text without
+    /// boundary-shifting between iterations. Lower = riskier text,
+    /// higher = same buffer-grow data loss as commit-3.
+    private let stableContextSec: Double = 5.0
     private let lineMaxChars: Int = 80              // failsafe line break
     /// All sentence-terminator characters we accept across zh/en. Includes
     /// half-width ASCII variants because some Whisper outputs mix them in.
@@ -251,38 +257,53 @@ final class VerbatimTranscriber: @unchecked Sendable {
 
         trimAudioBuffer(toRelative: lastCommittedEnd, baseOffset: offsetSec)
 
-        // Hard cap with force-commit: if the buffer is STILL too long
-        // (agreement not converging), commit older segments unconditionally
-        // before trimming. Better to write slightly-uncertain text than
-        // silently lose audio (the commit-2 4:17 / 39-second-gap symptom).
-        let bufferSec = Double(audioBuffer.count) / Double(Self.sampleRate)
-        if bufferSec > trimWindowSec {
-            let forceCommitSec = bufferSec - trimWindowSec
-            let currentHead = audioBufferOffsetSec
-            for seg in newSegments {
-                let segEndAbs = offsetSec + seg.end
-                if segEndAbs <= currentHead { continue }   // already committed
-                let segEndRelativeToHead = segEndAbs - currentHead
-                if segEndRelativeToHead <= forceCommitSec {
-                    let segText = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !segText.isEmpty {
-                        commitText(segText, atSec: offsetSec + seg.start)
-                    }
-                    trimAudioBuffer(toRelative: seg.end, baseOffset: offsetSec)
-                } else {
-                    break
+        // Aggressive force-commit (Option B from the commit-3 quality
+        // post-mortem). Run on EVERY iteration, not just when hitting
+        // the 15-s hard cap: any segment whose end is at least
+        // `stableContextSec` seconds before the current buffer tail has
+        // enough trailing audio for whisper to have produced stable
+        // text — commit it now without waiting for the second-iteration
+        // agreement.
+        //
+        // Rationale: commit-3 testing (1184-word reference, 5:50 audio)
+        // showed only 66% word coverage because LocalAgreement-2 alone
+        // can't converge when whisper re-segments the same content
+        // differently each iteration; the unconfirmed buffer grows to
+        // 15s, the brutal head-trim drops middle content. The biggest
+        // single gap was 33 consecutive lost words — a full
+        // sub-paragraph silently dropped. Always-on force-commit keeps
+        // the buffer bounded at ~5-6s and the brutal trim becomes
+        // dead code in practice.
+        let bufferTailAbs =
+            audioBufferOffsetSec + Double(audioBuffer.count) / Double(Self.sampleRate)
+        let currentHead = audioBufferOffsetSec
+        for seg in newSegments {
+            let segEndAbs = offsetSec + seg.end
+            if segEndAbs <= currentHead { continue }   // already committed by LCP
+            let trailingContext = bufferTailAbs - segEndAbs
+            if trailingContext >= stableContextSec {
+                let segText = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !segText.isEmpty {
+                    commitText(segText, atSec: offsetSec + seg.start)
                 }
+                trimAudioBuffer(toRelative: seg.end, baseOffset: offsetSec)
+            } else {
+                // Segments are time-ordered, so once we hit one inside
+                // the unstable tail window, the rest are too.
+                break
             }
-            // Last-resort brutal head trim if force-commit walk found
-            // nothing (e.g., whisper returned empty segments) — bound the
-            // buffer at all costs.
-            let postForceSec = Double(audioBuffer.count) / Double(Self.sampleRate)
-            if postForceSec > trimWindowSec {
-                let excess = audioBuffer.count - Int(trimWindowSec * Double(Self.sampleRate))
-                if excess > 0 {
-                    audioBuffer.removeFirst(excess)
-                    audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
-                }
+        }
+
+        // Last-resort brutal head trim — kept as a safety net for the
+        // rare case where whisper returns no segments at all but audio
+        // keeps flowing (e.g., long stretch of pure silence with model
+        // hallucination filtered out).
+        let postForceSec = Double(audioBuffer.count) / Double(Self.sampleRate)
+        if postForceSec > trimWindowSec {
+            let excess = audioBuffer.count - Int(trimWindowSec * Double(Self.sampleRate))
+            if excess > 0 {
+                audioBuffer.removeFirst(excess)
+                audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
             }
         }
 
