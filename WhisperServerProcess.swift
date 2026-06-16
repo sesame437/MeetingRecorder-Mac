@@ -104,13 +104,15 @@ final class WhisperServerProcess: @unchecked Sendable {
             "--host", "127.0.0.1",
             "--port", String(assignedPort),
             "--language", language,
-            // commit-5 mitigation: flash-attn (default true) is a known
-            // contributor to the long-running Metal pipeline deadlock that
-            // hits whisper.cpp around the 7-8 minute mark. Disabling it
-            // costs ~10-15% inference speed but avoids the cliff. The
-            // watchdog in VerbatimTranscriber will still restart us if
-            // the bug recurs.
-            "--no-flash-attn",
+            // Note: previously we passed --no-flash-attn as a workaround
+            // for the long-run Metal pipeline cliff observed against
+            // whisper-cpp 1.8.4. The real culprit was almost certainly
+            // PR #3784 in whisper-cpp 1.8.5 — server params leaking
+            // between requests, accumulating into a wedged decoder state
+            // around the 7-8 minute mark. We've upgraded to 1.8.6, which
+            // includes that fix, so flash-attn is back on (~10-15% faster
+            // inference). The watchdog in VerbatimTranscriber stays as
+            // a safety net if the bug ever recurs in another form.
             // NOTE: --print-progress is a boolean toggle (default false).
             // Do not pass "false" as a value or whisper-server treats it as
             // a stray positional argument, prints help, and exits.
