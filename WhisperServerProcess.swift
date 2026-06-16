@@ -93,7 +93,9 @@ final class WhisperServerProcess: @unchecked Sendable {
             "--host", "127.0.0.1",
             "--port", String(assignedPort),
             "--language", language,
-            "--print-progress", "false",
+            // NOTE: --print-progress is a boolean toggle (default false).
+            // Do not pass "false" as a value or whisper-server treats it as
+            // a stray positional argument, prints help, and exits.
         ]
         // Discard stdout/stderr to /dev/null-like pipes; stash for diagnostics.
         let outPipe = Pipe()
