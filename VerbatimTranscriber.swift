@@ -185,17 +185,25 @@ final class VerbatimTranscriber: @unchecked Sendable {
     private func trimAudioBuffer(toAbsolute cutoff: Double) {
         let trimSec = cutoff - audioBufferOffsetSec
         guard trimSec > 0 else { return }
-        let trimSamples = min(max(Int((trimSec * Double(Self.sampleRate)).rounded()), 0), audioBuffer.count)
+        // Use truncation (not rounding) to avoid trimming past the
+        // requested cutoff — keeps audioBufferOffsetSec ≤ cutoff,
+        // preventing sub-ms epoch drift over hundreds of iterations.
+        let trimSamples = min(max(Int(trimSec * Double(Self.sampleRate)), 0), audioBuffer.count)
         if trimSamples > 0 {
             audioBuffer.removeFirst(trimSamples)
             audioBufferOffsetSec += Double(trimSamples) / Double(Self.sampleRate)
         }
-        // Hard cap safety net
+        // Hard cap safety net. If the buffer is STILL too long (agreement
+        // not converging — e.g. language detection flip-flopping), force
+        // trim from the head AND invalidate lastSegments so the next
+        // iteration doesn't compare against "ghost segments" that
+        // reference audio we just discarded.
         let maxSamples = Int(trimWindowSec * Double(Self.sampleRate))
         if audioBuffer.count > maxSamples {
             let excess = audioBuffer.count - maxSamples
             audioBuffer.removeFirst(excess)
             audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
+            lastSegments.removeAll()
         }
     }
 }

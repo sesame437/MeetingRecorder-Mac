@@ -146,7 +146,11 @@ final class WhisperServerClient: @unchecked Sendable {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return nil
         }
-        guard let raw = obj["segments"] as? [[String: Any]] else { return [] }
+        // Return nil (not []) when "segments" key is missing — a missing
+        // key indicates a malformed response (version mismatch, server
+        // error page as JSON) which should propagate as .parseFailed so
+        // the watchdog can act on it.
+        guard let raw = obj["segments"] as? [[String: Any]] else { return nil }
         var out: [Segment] = []
         out.reserveCapacity(raw.count)
         for seg in raw {
