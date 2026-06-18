@@ -1,123 +1,50 @@
 import Foundation
 
-/// Real-time verbatim transcription pipeline driven by the live PCM tap on
-/// `AudioRecorder`.
+/// Thin orchestrator for the verbatim transcription pipeline.
 ///
-/// Pipeline (per the design we agreed during grilling):
+/// Responsibilities (post-refactor):
+///   * Audio buffer management (append PCM, snapshot for inference)
+///   * Inference scheduling (min-chunk gating, in-flight tracking)
+///   * Watchdog (consecutive failure counting → server restart)
+///   * Lifecycle (start / stop / flush)
 ///
-///   * Receive Float32 mono 16 kHz samples via `append(_:sampleRate:)`.
-///   * Maintain an unconfirmed audio buffer; once it has ≥ `minChunkSec`
-///     of new audio AND no inference is in flight, POST the buffer as a
-///     WAV to whisper-server's /inference endpoint with
-///     `response_format=verbose_json`.
-///   * Apply LocalAgreement-2: a segment is "committed" only when its
-///     trimmed text matches the same-index segment from the previous
-///     iteration (longest common prefix wins).
-///   * Trim the audio buffer at the last committed segment's end, then
-///     hard-cap at `trimWindowSec` to bound runaway buffers.
-///   * Append committed text to the current line buffer; flush a line to
-///     `.verbatim.md` when it ends in a sentence terminator (`。！？.!?`)
-///     or exceeds `lineMaxChars`.
-///
-/// On `flush()` (called from stopRecording), we run one final inference
-/// over whatever audio is still buffered and commit ALL segments
-/// unconditionally — bypassing the two-iteration agreement so the last
-/// few seconds of speech don't get dropped.
+/// All HTTP/WAV/JSON knowledge lives in `WhisperServerClient`.
+/// All agreement/line-building logic lives in `LocalAgreementProcessor`.
 final class VerbatimTranscriber: @unchecked Sendable {
 
-    // MARK: - Tuning (from Q2/Q3 decisions + commit-4 quality fix)
-    private let minChunkSec: Double = 1.0           // run inference every ≥1s of new audio
-    private let trimWindowSec: Double = 15.0        // last-resort buffer cap
-    /// Trailing audio that a segment needs behind it to be considered
-    /// "stable enough" for force-commit (Option B). 5 s gives whisper
-    /// enough lookahead context to have produced final text without
-    /// boundary-shifting between iterations. Lower = riskier text,
-    /// higher = same buffer-grow data loss as commit-3.
-    private let stableContextSec: Double = 5.0
-    private let lineMaxChars: Int = 80              // failsafe line break
-    /// All sentence-terminator characters we accept across zh/en. Includes
-    /// half-width ASCII variants because some Whisper outputs mix them in.
-    private static let sentenceTerminators: Set<Character> =
-        ["。", "！", "？", ".", "!", "?"]
-    /// Standard sample rate of AudioRecorder's downmixed tap.
+    // MARK: - Tuning
+    private let minChunkSec: Double = 1.0
+    private let trimWindowSec: Double = 15.0
     private static let sampleRate: Int = 16_000
 
     // MARK: - Dependencies
-    private let server: WhisperServerProcess
+    private let client: WhisperServerClient
     private let writer: VerbatimWriter
-    private let language: String   // "auto" | "zh" | "en"
 
-    // MARK: - State (guarded by `queue` unless noted)
+    // MARK: - State (guarded by `queue`)
     private let queue = DispatchQueue(label: "verbatim-transcriber")
-
-    /// Pending audio samples that have not yet been confirmed by LocalAgreement.
     private var audioBuffer: [Float] = []
-    /// Wall-clock seconds (relative to sessionStart) at which `audioBuffer[0]`
-    /// was captured. Trimming the head of the buffer advances this.
     private var audioBufferOffsetSec: Double = 0
-
-    /// Last inference's segments, with start/end made relative to the
-    /// CURRENT buffer head (i.e., re-zeroed every time we trim). Used by
-    /// `applyAgreement` for the prefix comparison.
-    private var lastSegments: [Segment] = []
-
-    /// Text that's been committed but not yet emitted as a `.verbatim.md`
-    /// line. Flushed on punctuation or `lineMaxChars`.
-    private var lineBuffer: String = ""
-    private var lineStartSec: Double?
-
+    private var lastSegments: [LocalAgreementProcessor.Segment] = []
+    private var processor = LocalAgreementProcessor()
     private var sessionStart: Date = .distantPast
     private var stopped: Bool = true
-    /// Set while an inference HTTP request is outstanding; gates new
-    /// transcribes so they don't pile up faster than whisper-server can
-    /// serve them.
     private var inFlight: Bool = false
-    /// Watchdog state for the long-running whisper-server Metal-pipeline
-    /// deadlock. Each /inference request that fails (timeout / connection
-    /// drop / HTTP non-200) bumps `consecutiveFailures`; on the threshold
-    /// we kick off a server restart and gate `maybeTranscribe` until the
-    /// new server is ready.
+
+    // Watchdog
     private var consecutiveFailures: Int = 0
     private let restartFailureThreshold: Int = 2
     private var serverRestartInProgress: Bool = false
 
-    private let httpSession: URLSession
-
-    /// One transcribed unit from whisper-server (`segments[]` entry).
-    /// Times are in seconds, relative to the WAV we sent.
-    private struct Segment {
-        let text: String
-        let start: Double
-        let end: Double
-    }
-
     // MARK: - Init
 
-    init(server: WhisperServerProcess, writer: VerbatimWriter, language: String) {
-        self.server = server
+    init(client: WhisperServerClient, writer: VerbatimWriter) {
+        self.client = client
         self.writer = writer
-        self.language = language
-        let cfg = URLSessionConfiguration.ephemeral
-        // 15 s timeout: a healthy whisper-server processes a 15 s WAV (our
-        // largest possible payload) in ~1-2 s on M-series, so 15 s is
-        // 7-10× headroom for legit inference and halves the watchdog's
-        // cliff-detection delay (was 30+30=60 s, now 15+15=30 s).
-        cfg.timeoutIntervalForRequest = 15
-        cfg.timeoutIntervalForResource = 15
-        self.httpSession = URLSession(configuration: cfg)
     }
 
-    // MARK: - Public surface (called from MainActor / audio queue)
+    // MARK: - Public lifecycle
 
-    /// Bind the transcriber to a session start (the mp4's t=0) and lay
-    /// down the .verbatim.md preamble. `initialOffsetSec` is the offset
-    /// of the first PCM sample we'll receive measured from `sessionStart`
-    /// — for the normal "verbatim was enabled before pressing Record"
-    /// path that's 0; for the "toggled verbatim ON two minutes into
-    /// recording" path it's `Date().timeIntervalSince(sessionStart)` so
-    /// that committed timestamps in .verbatim.md still align with the
-    /// mp4 timeline (a user grepping the file at minute 2:15 finds
-    /// `[00:02:15]`, not `[00:00:00]`).
     func start(sessionStart: Date, initialOffsetSec: Double = 0) throws {
         try writer.writePreamble()
         queue.sync {
@@ -125,8 +52,7 @@ final class VerbatimTranscriber: @unchecked Sendable {
             self.audioBuffer.removeAll(keepingCapacity: true)
             self.audioBufferOffsetSec = initialOffsetSec
             self.lastSegments.removeAll()
-            self.lineBuffer = ""
-            self.lineStartSec = nil
+            self.processor.reset()
             self.stopped = false
             self.inFlight = false
             self.consecutiveFailures = 0
@@ -134,12 +60,7 @@ final class VerbatimTranscriber: @unchecked Sendable {
         }
     }
 
-    /// Receive a PCM chunk from `AudioRecorder.onPCMChunk`. Runs on the
-    /// audio queue, so we hop onto our own serial queue immediately.
     func append(_ samples: [Float], sampleRate: Double) {
-        // We only support the AudioRecorder's standard 16 kHz tap; if
-        // somebody hands us anything else, we drop it (the post-mix tap
-        // is hard-wired to 16k, so this is just defense-in-depth).
         guard Int(sampleRate.rounded()) == Self.sampleRate else { return }
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
@@ -148,12 +69,7 @@ final class VerbatimTranscriber: @unchecked Sendable {
         }
     }
 
-    /// Force-commit anything still unconfirmed. Called from stopRecording
-    /// before the whisper-server is killed.
     func flush() async {
-        // Snapshot remaining audio + rebase point on the queue, then run
-        // one final inference outside it. Anything < 100ms is too short
-        // for Whisper to get useful tokens out of, skip.
         let snapshot: ([Float], Double, Bool) = await withCheckedContinuation { cont in
             queue.async { [weak self] in
                 guard let self else { cont.resume(returning: ([], 0, true)); return }
@@ -167,19 +83,11 @@ final class VerbatimTranscriber: @unchecked Sendable {
             await runInference(samples: samples, offsetSec: offsetSec, isFinal: true)
         }
 
-        // Drain anything still in lineBuffer + write a sentinel so
-        // downstream readers can spot "transcription ended cleanly here"
-        // visually (frontmatter `verbatim_ended_at` says it precisely,
-        // the sentinel is the human-readable equivalent at the bottom of
-        // the file).
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             queue.async { [weak self] in
                 guard let self else { cont.resume(); return }
-                if !self.lineBuffer.isEmpty {
-                    let stamp = self.lineStartSec ?? self.audioBufferOffsetSec
-                    try? self.writer.appendLine(self.lineBuffer, at: stamp)
-                    self.lineBuffer = ""
-                    self.lineStartSec = nil
+                if let remaining = self.processor.drainLineBuffer() {
+                    try? self.writer.appendLine(remaining.text, at: remaining.atSec)
                 }
                 let endSec = max(0, Date().timeIntervalSince(self.sessionStart))
                 try? self.writer.appendLine("— end of transcript —", at: endSec)
@@ -190,15 +98,12 @@ final class VerbatimTranscriber: @unchecked Sendable {
 
     func stop() { queue.sync { self.stopped = true } }
 
-    // MARK: - Inference loop (runs on `queue`)
+    // MARK: - Inference scheduling
 
     private func maybeTranscribe() {
         guard !inFlight, !stopped, !serverRestartInProgress else { return }
         let bufferSec = Double(audioBuffer.count) / Double(Self.sampleRate)
         guard bufferSec >= minChunkSec else { return }
-        // Snapshot under queue, then hop to detached Task — keeps the
-        // audio queue free to keep accumulating samples while inference
-        // runs (~1-2s on M-series).
         let samples = audioBuffer
         let offsetSec = audioBufferOffsetSec
         inFlight = true
@@ -208,364 +113,89 @@ final class VerbatimTranscriber: @unchecked Sendable {
     }
 
     private func runInference(samples: [Float], offsetSec: Double, isFinal: Bool) async {
-        var inferenceSucceeded = false
+        var success = false
         defer {
-            // Updates run on the serial queue so consecutiveFailures /
-            // serverRestartInProgress are race-free with maybeTranscribe.
             queue.async { [weak self] in
                 guard let self else { return }
                 self.inFlight = false
-                if inferenceSucceeded {
+                if success {
                     self.consecutiveFailures = 0
                     self.maybeTranscribe()
                     return
                 }
-                // Failure path: bump counter, possibly trigger restart.
                 self.consecutiveFailures += 1
                 if self.consecutiveFailures >= self.restartFailureThreshold,
-                   !self.serverRestartInProgress,
-                   !self.stopped {
-                    NSLog("verbatim: \(self.consecutiveFailures) consecutive inference failures → restarting whisper-server")
+                   !self.serverRestartInProgress, !self.stopped {
+                    NSLog("verbatim: \(self.consecutiveFailures) consecutive failures → restarting")
                     self.serverRestartInProgress = true
-                    Task.detached { [weak self] in
-                        await self?.runServerRestart()
-                    }
-                    return  // skip maybeTranscribe; restart handler will call it
+                    Task.detached { [weak self] in await self?.doRestart() }
+                    return
                 }
                 self.maybeTranscribe()
             }
         }
 
-        guard let url = server.inferenceURL else { return }
-        guard let wav = makeWAV(samples: samples) else { return }
-
-        let boundary = "----meeting-\(UUID().uuidString)"
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = makeMultipartBody(boundary: boundary, wav: wav)
-
         do {
-            let (data, response) = try await httpSession.data(for: request)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-                NSLog("verbatim: inference HTTP \(code)")
-                return
-            }
-            guard let segments = parseSegments(data) else {
-                NSLog("verbatim: failed to parse verbose_json")
-                return
-            }
-            inferenceSucceeded = true
+            let segments = try await client.transcribe(samples: samples)
+            success = true
             queue.async { [weak self] in
                 guard let self, !self.stopped else { return }
-                if isFinal {
-                    self.applyFinalCommit(segments: segments, offsetSec: offsetSec)
-                } else {
-                    self.applyAgreement(newSegments: segments, offsetSec: offsetSec)
+                let bufferTailSec = self.audioBufferOffsetSec +
+                    Double(self.audioBuffer.count) / Double(Self.sampleRate)
+                let result = self.processor.process(
+                    newSegments: segments,
+                    previousSegments: self.lastSegments,
+                    bufferOffsetSec: offsetSec,
+                    bufferTailSec: bufferTailSec,
+                    isFinal: isFinal
+                )
+                for line in result.lines {
+                    try? self.writer.appendLine(line.text, at: line.atSec)
                 }
+                self.trimAudioBuffer(toAbsolute: result.trimSec)
+                self.lastSegments = result.updatedPendingSegments
             }
         } catch {
             NSLog("verbatim: inference error: \(error.localizedDescription)")
         }
     }
 
-    /// Tear down + re-spawn the whisper-server when the long-running
-    /// Metal pipeline has deadlocked. Runs on a detached Task (off the
-    /// serial queue) so the restart's await doesn't block sample
-    /// appends. On success we clear watchdog state; on failure we leave
-    /// `serverRestartInProgress` cleared too — the next inference will
-    /// retry against the (still-stuck) server, fail again, and loop
-    /// back here.
-    private func runServerRestart() async {
-        let success: Bool
+    // MARK: - Server restart
+
+    private func doRestart() async {
+        let ok: Bool
         do {
-            try await server.restart()
-            success = true
-            NSLog("verbatim: whisper-server restart OK on port \(server.port)")
+            try await client.restartServer()
+            ok = true
+            NSLog("verbatim: server restart OK")
         } catch {
-            success = false
-            NSLog("verbatim: whisper-server restart failed: \(error.localizedDescription)")
+            ok = false
+            NSLog("verbatim: server restart failed: \(error.localizedDescription)")
         }
         queue.async { [weak self] in
             guard let self else { return }
             self.serverRestartInProgress = false
-            // Reset counter so we don't immediately retrigger restart
-            // on the next failure; give the new server a fair chance.
-            if success { self.consecutiveFailures = 0 }
+            if ok { self.consecutiveFailures = 0 }
             self.maybeTranscribe()
         }
     }
 
-    // MARK: - LocalAgreement-2 (runs on `queue`)
+    // MARK: - Buffer trim
 
-    /// LocalAgreement-2: commit the longest CHARACTER prefix that two
-    /// consecutive iterations agree on. We can't compare segment-by-segment
-    /// because Whisper re-segments the same content differently between
-    /// runs ("we are in the era" / "of AI" vs "we are in" / "the era of
-    /// AI") — that bug ate ~75% of speech in commit 2 testing.
-    private func applyAgreement(newSegments: [Segment], offsetSec: Double) {
-        let prevText = Self.joinSegments(lastSegments)
-        let currentText = Self.joinSegments(newSegments)
-        let prefixLen = Self.longestCommonPrefixLength(prevText, currentText)
-
-        // Walk current segments, committing those FULLY contained within
-        // the agreed prefix. Partial-segment overlap is left for the next
-        // iteration to firm up — committing a half-segment loses Whisper's
-        // segment-level timing/punctuation cues.
-        var charsUsed = 0
-        var lastCommittedEnd: Double = 0
-        var first = true
-        for seg in newSegments {
-            let txt = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if txt.isEmpty { continue }
-            let sep = first ? 0 : 1   // single-space separator between segments
-            let need = charsUsed + sep + txt.count
-            if need <= prefixLen {
-                commitText(txt, atSec: offsetSec + seg.start)
-                lastCommittedEnd = seg.end
-                charsUsed = need
-                first = false
-            } else {
-                break
-            }
-        }
-
-        trimAudioBuffer(toRelative: lastCommittedEnd, baseOffset: offsetSec)
-
-        // Aggressive force-commit (Option B from the commit-3 quality
-        // post-mortem). Run on EVERY iteration, not just when hitting
-        // the 15-s hard cap: any segment whose end is at least
-        // `stableContextSec` seconds before the current buffer tail has
-        // enough trailing audio for whisper to have produced stable
-        // text — commit it now without waiting for the second-iteration
-        // agreement.
-        //
-        // Rationale: commit-3 testing (1184-word reference, 5:50 audio)
-        // showed only 66% word coverage because LocalAgreement-2 alone
-        // can't converge when whisper re-segments the same content
-        // differently each iteration; the unconfirmed buffer grows to
-        // 15s, the brutal head-trim drops middle content. The biggest
-        // single gap was 33 consecutive lost words — a full
-        // sub-paragraph silently dropped. Always-on force-commit keeps
-        // the buffer bounded at ~5-6s and the brutal trim becomes
-        // dead code in practice.
-        let bufferTailAbs =
-            audioBufferOffsetSec + Double(audioBuffer.count) / Double(Self.sampleRate)
-        let currentHead = audioBufferOffsetSec
-        for seg in newSegments {
-            let segEndAbs = offsetSec + seg.end
-            if segEndAbs <= currentHead { continue }   // already committed by LCP
-            let trailingContext = bufferTailAbs - segEndAbs
-            if trailingContext >= stableContextSec {
-                let segText = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !segText.isEmpty {
-                    commitText(segText, atSec: offsetSec + seg.start)
-                }
-                trimAudioBuffer(toRelative: seg.end, baseOffset: offsetSec)
-            } else {
-                // Segments are time-ordered, so once we hit one inside
-                // the unstable tail window, the rest are too.
-                break
-            }
-        }
-
-        // Last-resort brutal head trim — kept as a safety net for the
-        // rare case where whisper returns no segments at all but audio
-        // keeps flowing (e.g., long stretch of pure silence with model
-        // hallucination filtered out).
-        let postForceSec = Double(audioBuffer.count) / Double(Self.sampleRate)
-        if postForceSec > trimWindowSec {
-            let excess = audioBuffer.count - Int(trimWindowSec * Double(Self.sampleRate))
-            if excess > 0 {
-                audioBuffer.removeFirst(excess)
-                audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
-            }
-        }
-
-        // Rebase the surviving segments against the new buffer head so
-        // next iteration's prefix-comparison aligns.
-        let currentHeadAbs = audioBufferOffsetSec
-        lastSegments = newSegments.compactMap { seg in
-            let absEnd = offsetSec + seg.end
-            guard absEnd > currentHeadAbs else { return nil }
-            let absStart = offsetSec + seg.start
-            return Segment(text: seg.text,
-                           start: absStart - currentHeadAbs,
-                           end: absEnd - currentHeadAbs)
-        }
-    }
-
-    private func applyFinalCommit(segments: [Segment], offsetSec: Double) {
-        for seg in segments {
-            commitText(seg.text, atSec: offsetSec + seg.start)
-        }
-    }
-
-    /// Trim the audio buffer up to `timeRelative` seconds past `baseOffset`.
-    /// Idempotent and safe if some other call has already trimmed past
-    /// that point.
-    private func trimAudioBuffer(toRelative timeRelative: Double, baseOffset: Double) {
-        guard timeRelative > 0 else { return }
-        let absoluteCutoff = baseOffset + timeRelative
-        let trimSec = absoluteCutoff - audioBufferOffsetSec
+    private func trimAudioBuffer(toAbsolute cutoff: Double) {
+        let trimSec = cutoff - audioBufferOffsetSec
         guard trimSec > 0 else { return }
-        let trimSamples = Int((trimSec * Double(Self.sampleRate)).rounded())
-        let safe = min(max(trimSamples, 0), audioBuffer.count)
-        if safe > 0 {
-            audioBuffer.removeFirst(safe)
-            audioBufferOffsetSec += Double(safe) / Double(Self.sampleRate)
+        let trimSamples = min(max(Int((trimSec * Double(Self.sampleRate)).rounded()), 0), audioBuffer.count)
+        if trimSamples > 0 {
+            audioBuffer.removeFirst(trimSamples)
+            audioBufferOffsetSec += Double(trimSamples) / Double(Self.sampleRate)
         }
-    }
-
-    private static func joinSegments(_ segments: [Segment]) -> String {
-        return segments
-            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-    }
-
-    /// Longest common prefix at the Swift `Character` level (grapheme
-    /// clusters), so CJK is counted by visible character not byte.
-    private static func longestCommonPrefixLength(_ a: String, _ b: String) -> Int {
-        var ai = a.makeIterator()
-        var bi = b.makeIterator()
-        var n = 0
-        while let ac = ai.next(), let bc = bi.next(), ac == bc {
-            n += 1
+        // Hard cap safety net
+        let maxSamples = Int(trimWindowSec * Double(Self.sampleRate))
+        if audioBuffer.count > maxSamples {
+            let excess = audioBuffer.count - maxSamples
+            audioBuffer.removeFirst(excess)
+            audioBufferOffsetSec += Double(excess) / Double(Self.sampleRate)
         }
-        return n
-    }
-
-    // MARK: - Line builder (runs on `queue`)
-
-    private func commitText(_ raw: String, atSec startSec: Double) {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        // Whisper's standalone "[BLANK_AUDIO]", "[Music]", "[音乐]" etc. are
-        // metadata, not transcript content. Drop them.
-        if trimmed.hasPrefix("[") && trimmed.hasSuffix("]") { return }
-        if trimmed.hasPrefix("(") && trimmed.hasSuffix(")") { return }
-
-        if lineBuffer.isEmpty {
-            lineStartSec = startSec
-            lineBuffer = trimmed
-        } else {
-            // ASCII-vs-ASCII boundary needs a space; CJK runs don't.
-            if Self.needsSpaceJoin(prev: lineBuffer, next: trimmed) {
-                lineBuffer += " " + trimmed
-            } else {
-                lineBuffer += trimmed
-            }
-        }
-
-        if shouldBreakLine(lineBuffer) {
-            try? writer.appendLine(lineBuffer, at: lineStartSec ?? startSec)
-            lineBuffer = ""
-            lineStartSec = nil
-        }
-    }
-
-    private func shouldBreakLine(_ s: String) -> Bool {
-        if let last = s.last, Self.sentenceTerminators.contains(last) { return true }
-        if s.count >= lineMaxChars { return true }
-        return false
-    }
-
-    /// Heuristic: insert a space when joining two runs of ASCII letters/
-    /// digits (English-style word boundaries). Any CJK on either side
-    /// means no space.
-    private static func needsSpaceJoin(prev: String, next: String) -> Bool {
-        guard let last = prev.last, let first = next.first else { return false }
-        let asciiAlnum = CharacterSet.alphanumerics.intersection(.init(charactersIn: "0"..."z"))
-        let lastIsASCII = last.unicodeScalars.allSatisfy { asciiAlnum.contains($0) }
-        let firstIsASCII = first.unicodeScalars.allSatisfy { asciiAlnum.contains($0) }
-        return lastIsASCII && firstIsASCII
-    }
-
-    // MARK: - WAV encoding (Float32 mono 16 kHz → s16le PCM + RIFF)
-
-    private func makeWAV(samples: [Float]) -> Data? {
-        guard !samples.isEmpty else { return nil }
-        let sr = UInt32(Self.sampleRate)
-        let numChannels: UInt16 = 1
-        let bitsPerSample: UInt16 = 16
-        let byteRate = sr * UInt32(numChannels) * UInt32(bitsPerSample / 8)
-        let blockAlign: UInt16 = numChannels * (bitsPerSample / 8)
-        let dataSize = UInt32(samples.count) * UInt32(bitsPerSample / 8)
-        let chunkSize = 36 + dataSize
-
-        var data = Data(capacity: 44 + Int(dataSize))
-        // RIFF
-        data.append(contentsOf: "RIFF".utf8)
-        data.append(contentsOf: withUnsafeBytes(of: chunkSize.littleEndian) { Array($0) })
-        data.append(contentsOf: "WAVE".utf8)
-        // fmt
-        data.append(contentsOf: "fmt ".utf8)
-        data.append(contentsOf: withUnsafeBytes(of: UInt32(16).littleEndian) { Array($0) })
-        data.append(contentsOf: withUnsafeBytes(of: UInt16(1).littleEndian) { Array($0) }) // PCM
-        data.append(contentsOf: withUnsafeBytes(of: numChannels.littleEndian) { Array($0) })
-        data.append(contentsOf: withUnsafeBytes(of: sr.littleEndian) { Array($0) })
-        data.append(contentsOf: withUnsafeBytes(of: byteRate.littleEndian) { Array($0) })
-        data.append(contentsOf: withUnsafeBytes(of: blockAlign.littleEndian) { Array($0) })
-        data.append(contentsOf: withUnsafeBytes(of: bitsPerSample.littleEndian) { Array($0) })
-        // data
-        data.append(contentsOf: "data".utf8)
-        data.append(contentsOf: withUnsafeBytes(of: dataSize.littleEndian) { Array($0) })
-        // PCM samples
-        data.reserveCapacity(data.count + samples.count * 2)
-        for f in samples {
-            // Clamp + scale to Int16 range.
-            let clamped = max(-1.0, min(1.0, f))
-            let s = Int16(clamped * 32767)
-            data.append(contentsOf: withUnsafeBytes(of: s.littleEndian) { Array($0) })
-        }
-        return data
-    }
-
-    // MARK: - Multipart body for whisper-server's /inference
-
-    private func makeMultipartBody(boundary: String, wav: Data) -> Data {
-        var body = Data()
-        let crlf = "\r\n"
-
-        func appendField(_ name: String, _ value: String) {
-            body.append(contentsOf: "--\(boundary)\(crlf)".utf8)
-            body.append(contentsOf: "Content-Disposition: form-data; name=\"\(name)\"\(crlf)\(crlf)".utf8)
-            body.append(contentsOf: "\(value)\(crlf)".utf8)
-        }
-
-        // file part
-        body.append(contentsOf: "--\(boundary)\(crlf)".utf8)
-        body.append(contentsOf: "Content-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\(crlf)".utf8)
-        body.append(contentsOf: "Content-Type: audio/wav\(crlf)\(crlf)".utf8)
-        body.append(wav)
-        body.append(contentsOf: crlf.utf8)
-
-        appendField("response_format", "verbose_json")
-        appendField("language", language)
-        appendField("temperature", "0.0")
-
-        body.append(contentsOf: "--\(boundary)--\(crlf)".utf8)
-        return body
-    }
-
-    // MARK: - JSON parse (verbose_json → [Segment])
-
-    private func parseSegments(_ data: Data) -> [Segment]? {
-        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return nil
-        }
-        // whisper-server's verbose_json: top-level "segments": [{ start, end, text, ... }, …]
-        guard let raw = obj["segments"] as? [[String: Any]] else { return [] }
-        var out: [Segment] = []
-        out.reserveCapacity(raw.count)
-        for seg in raw {
-            guard let text = seg["text"] as? String else { continue }
-            let start = (seg["start"] as? Double) ?? 0
-            let end = (seg["end"] as? Double) ?? start
-            out.append(Segment(text: text, start: start, end: end))
-        }
-        return out
     }
 }

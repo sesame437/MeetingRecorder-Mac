@@ -372,7 +372,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 trimWindowSec: 15.0
             )
         )
-        let transcriber = VerbatimTranscriber(server: server, writer: writer, language: language)
+        let client = WhisperServerClient(server: server, language: language)
+        let transcriber = VerbatimTranscriber(client: client, writer: writer)
         do {
             try transcriber.start(sessionStart: sessionStart, initialOffsetSec: initialOffsetSec)
         } catch {

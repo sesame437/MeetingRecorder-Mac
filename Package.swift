@@ -33,8 +33,10 @@ let package = Package(
                 "NotesWriter.swift",
                 "SummaryClient.swift",
                 "WhisperServerProcess.swift",
+                "WhisperServerClient.swift",
                 "VerbatimWriter.swift",
                 "VerbatimTranscriber.swift",
+                "LocalAgreementProcessor.swift",
             ]
         )
     ]
