@@ -4,6 +4,7 @@ import AVFoundation
 import CoreMedia
 import Combine
 import UserNotifications
+import IOKit.pwr_mgt
 
 // `@unchecked Sendable`: every mutable field below is either confined to the
 // main queue (the @Published ones) or guarded by `micBufferLock`. Crossing
@@ -70,6 +71,11 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     private let micBufferLock = NSLock()
     private var micConverter: AVAudioConverter?
     private let targetSampleRate: Double = 48000
+
+    /// Power assertion that prevents macOS idle sleep while recording.
+    /// Created in startRecording(), released in stopRecording().
+    private var sleepAssertionID: IOPMAssertionID = 0
+    private var sleepAssertionActive = false
 
     /// Set when the user explicitly picks a mic from our menu during a
     /// session. While true, the system-default-input watcher won't override
@@ -169,6 +175,22 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
             setupMicCapture()
         }
 
+        // Prevent macOS from sleeping due to idle while recording.
+        // Without this, the system suspends SCStream after the idle
+        // timeout and our recording gets cut short.
+        var assertionID: IOPMAssertionID = 0
+        let result = IOPMAssertionCreateWithName(
+            kIOPMAssertionTypeNoIdleSleep as CFString,
+            IOPMAssertionLevel(kIOPMAssertionLevelOn),
+            "MeetingRecorder is recording audio" as CFString,
+            &assertionID
+        )
+        if result == kIOReturnSuccess {
+            sleepAssertionID = assertionID
+            sleepAssertionActive = true
+            NSLog("recorder: idle-sleep assertion created (id=\(assertionID))")
+        }
+
         recordingStartTime = Date()
         isRecording = true
         await MainActor.run {
@@ -203,6 +225,13 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
         systemAudioLevel = 0
         micAudioLevel = 0
         userPinnedMic = false
+
+        // Release the idle-sleep assertion so macOS can sleep normally.
+        if sleepAssertionActive {
+            IOPMAssertionRelease(sleepAssertionID)
+            sleepAssertionActive = false
+            NSLog("recorder: idle-sleep assertion released")
+        }
 
         if let url = savedURL { sendNotification(filename: url.lastPathComponent) }
     }
