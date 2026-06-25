@@ -34,6 +34,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // correct `started_at` (mp4 origin) when verbatim is enabled mid-record.
     private var recordingSessionStart: Date?
     private var recordingSessionId: UUID?
+    private var summaryServerPanel: SummaryServerPanel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -61,6 +62,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         recorder.$isRecording
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in self?.updateIcon(); self?.rebuildMenu() }
+            .store(in: &cancellables)
+
+        // Rebuild menu when summary server URL changes (after panel Save)
+        recorder.$liveSummaryURL
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.rebuildMenu() }
             .store(in: &cancellables)
 
         // Update menu every 0.5s during recording (for timer + levels)
@@ -222,6 +229,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dirItem.target = self
         menu.addItem(dirItem)
 
+        // Summary server URL
+        let urlDisplay = recorder.liveSummaryURL.isEmpty ? "(not configured)" : truncatedURL(recorder.liveSummaryURL)
+        let summaryItem = NSMenuItem(title: "Summary Server: \(urlDisplay)", action: #selector(openSummaryServerPanel), keyEquivalent: "")
+        summaryItem.target = self
+        menu.addItem(summaryItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit", action: #selector(quitApp), keyEquivalent: "q")
@@ -299,8 +312,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
 
                 // 5) Summary client. Init is failable: returns nil when
-                //    LIVE_SUMMARY_URL is unset, so we just skip the
-                //    feature instead of pointing the timer at thin air.
+                //    the summary server URL is unconfigured.
                 //    Captions + verbatim continue regardless.
                 if recorder.captionsEnabled,
                    let buffer = self.transcriptBuffer,
@@ -315,7 +327,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     summary.start(intervalSec: 180)
                 } else if recorder.captionsEnabled {
-                    self.captionPanel?.showOffline("summary unavailable — set LIVE_SUMMARY_URL")
+                    self.captionPanel?.showOffline("summary unavailable — configure Summary Server")
                 }
             } catch {
                 NSLog("Recording failed: \(error)")
@@ -648,6 +660,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             recorder.saveDirectory = url
             rebuildMenu()
         }
+    }
+
+    @objc private func openSummaryServerPanel() {
+        if summaryServerPanel == nil {
+            summaryServerPanel = SummaryServerPanel(recorder: recorder)
+        }
+        summaryServerPanel?.show()
+    }
+
+    private func truncatedURL(_ url: String) -> String {
+        url.count > 35 ? String(url.prefix(35)) + "…" : url
     }
 
     @objc private func quitApp() {

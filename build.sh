@@ -13,6 +13,11 @@ MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 DMG_PATH="$SCRIPT_DIR/MeetingRecorder.dmg"
 
+# 0. Auto-bump CalVer in Info.plist to today's date
+VERSION=$(date +"%Y.%-m.%-d")
+sed -i '' "s|<string>[0-9]*\.[0-9]*\.[0-9]*</string>|<string>${VERSION}</string>|g" "$SCRIPT_DIR/Info.plist"
+echo "Version: $VERSION"
+
 # 1. Build arm64 release (Apple Silicon only, per user preference)
 echo "Building arm64 release..."
 swift build -c release --arch arm64

@@ -41,6 +41,9 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     @Published var captionLanguage: String {
         didSet { UserDefaults.standard.set(captionLanguage, forKey: "captionLanguage") }
     }
+    @Published var liveSummaryURL: String {
+        didSet { UserDefaults.standard.set(liveSummaryURL, forKey: "liveSummaryURL") }
+    }
 
     /// Fan-out of the post-mixed audio for live captions.
     /// Called from the SCStream audio queue (NOT main). The closure receives
@@ -91,6 +94,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
         self.verbatimEnabled = UserDefaults.standard.object(forKey: "verbatimEnabled") as? Bool ?? false
         self.selectedMicID = UserDefaults.standard.string(forKey: "selectedMicID")
         self.captionLanguage = UserDefaults.standard.string(forKey: "captionLanguage") ?? "auto"
+        self.liveSummaryURL = UserDefaults.standard.string(forKey: "liveSummaryURL") ?? ""
         if let path = UserDefaults.standard.string(forKey: "saveDirectory") {
             self.saveDirectory = URL(fileURLWithPath: path)
         } else {
@@ -180,7 +184,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
         // timeout and our recording gets cut short.
         var assertionID: IOPMAssertionID = 0
         let result = IOPMAssertionCreateWithName(
-            kIOPMAssertionTypeNoIdleSleep as CFString,
+            kIOPMAssertionTypeNoDisplaySleep as CFString,
             IOPMAssertionLevel(kIOPMAssertionLevelOn),
             "MeetingRecorder is recording audio" as CFString,
             &assertionID

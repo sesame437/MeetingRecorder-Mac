@@ -32,6 +32,7 @@ let package = Package(
                 "CaptionPanel.swift",
                 "NotesWriter.swift",
                 "SummaryClient.swift",
+                "SummaryServerPanel.swift",
                 "WhisperServerProcess.swift",
                 "WhisperServerClient.swift",
                 "VerbatimWriter.swift",
