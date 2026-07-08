@@ -48,6 +48,16 @@ For development checks:
 swift build
 ```
 
+## Release Process
+
+Release titles use:
+
+```text
+MeetingRecorder vYYYY.M.D — Topic A + Topic B
+```
+
+Use [.github/RELEASE_NOTES_TEMPLATE.md](.github/RELEASE_NOTES_TEMPLATE.md) for every GitHub release. Before publishing, verify that the tag is `vYYYY.M.D`, `Info.plist` uses `YYYY.M.D`, and the release has the current `MeetingRecorder.dmg` attached.
+
 ## Run
 
 ```bash
