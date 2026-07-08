@@ -32,11 +32,12 @@ final class LiveCaptions: @unchecked Sendable {
     private let queue = DispatchQueue(label: "live-captions")
     private let targetRate: Double = 16_000
     private let windowSamples: Int = 16_000 * 5   // 5 s of 16 kHz mono
+    private let maxBufferSamples: Int = 16_000 * 15
 
     private var whisper: WhisperKit?
     private var buffer: [Float] = []       // guarded by queue
     private var sessionStart: Date = .distantPast
-    private var lastEmitSec: Double = 0
+    private var bufferStartSample: Int64 = 0
     private var inFlight: Bool = false     // guarded by queue
     private var stopped: Bool = true       // guarded by queue
 
@@ -71,7 +72,7 @@ final class LiveCaptions: @unchecked Sendable {
             self.whisper = instance
             self.buffer.removeAll(keepingCapacity: true)
             self.sessionStart = sessionStart
-            self.lastEmitSec = 0
+            self.bufferStartSample = 0
             self.inFlight = false
             self.stopped = false
         }
@@ -101,6 +102,11 @@ final class LiveCaptions: @unchecked Sendable {
                 resampled = out
             }
             self.buffer.append(contentsOf: resampled)
+            if self.buffer.count > self.maxBufferSamples {
+                let excess = self.buffer.count - self.maxBufferSamples
+                self.buffer.removeFirst(excess)
+                self.bufferStartSample += Int64(excess)
+            }
             self.maybeTranscribeWindow(isFinal: false)
         }
     }
@@ -112,12 +118,15 @@ final class LiveCaptions: @unchecked Sendable {
             queue.async { [weak self] in
                 guard let self, !self.stopped else { cont.resume(); return }
                 let samples = self.buffer
+                let startSec = Double(self.bufferStartSample) / self.targetRate
+                let endSec = Double(self.bufferStartSample + Int64(samples.count)) / self.targetRate
                 self.buffer.removeAll(keepingCapacity: true)
+                self.bufferStartSample += Int64(samples.count)
                 if samples.isEmpty {
                     cont.resume()
                     return
                 }
-                self.transcribe(samples: samples, isFinal: true) {
+                self.transcribe(samples: samples, startSec: startSec, endSec: endSec, isFinal: true) {
                     cont.resume()
                 }
             }
@@ -141,14 +150,19 @@ final class LiveCaptions: @unchecked Sendable {
         let windowSize = buffer.count
         let samples = Array(buffer.prefix(windowSize))
         buffer.removeFirst(windowSize)
-        transcribe(samples: samples, isFinal: isFinal, completion: {})
+        let startSec = Double(bufferStartSample) / targetRate
+        bufferStartSample += Int64(windowSize)
+        let endSec = Double(bufferStartSample) / targetRate
+        transcribe(samples: samples, startSec: startSec, endSec: endSec, isFinal: isFinal, completion: {})
     }
 
-    private func transcribe(samples: [Float], isFinal: Bool, completion: @escaping () -> Void) {
+    private func transcribe(samples: [Float],
+                            startSec: Double,
+                            endSec: Double,
+                            isFinal: Bool,
+                            completion: @escaping () -> Void) {
         guard let whisper else { completion(); return }
         inFlight = true
-        let sessionStart = self.sessionStart
-        let lastEmit = self.lastEmitSec
 
         Task.detached { [weak self] in
             defer {
@@ -163,9 +177,7 @@ final class LiveCaptions: @unchecked Sendable {
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { return }
 
-                let nowSec = Date().timeIntervalSince(sessionStart)
-                let event = CaptionEvent(text: trimmed, startSec: lastEmit, endSec: nowSec)
-                self?.queue.async { self?.lastEmitSec = nowSec }
+                let event = CaptionEvent(text: trimmed, startSec: startSec, endSec: endSec)
 
                 DispatchQueue.main.async {
                     self?.onCaption?(event)

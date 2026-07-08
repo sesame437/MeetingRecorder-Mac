@@ -6,10 +6,6 @@ import Foundation
 final class TranscriptBuffer {
     private(set) var entries: [TranscriptEntry] = []
 
-    var charCount: Int {
-        entries.reduce(0) { $0 + $1.text.count + 12 }   // +12 for "[HH:MM:SS] "
-    }
-
     func append(_ entry: TranscriptEntry) {
         entries.append(entry)
     }
@@ -36,6 +32,8 @@ final class NotesWriter {
     private var lastSummary: LiveSummary?
     private var transcriptEntries: [TranscriptEntry] = []
     private var endedAt: Date?
+    private let minFlushInterval: TimeInterval = 1.0
+    private var lastFlushAt: Date = .distantPast
 
     private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -52,24 +50,33 @@ final class NotesWriter {
 
     func appendTranscript(_ entry: TranscriptEntry) throws {
         transcriptEntries.append(entry)
-        try flush()
+        try flushIfDue()
     }
 
     func updateSummary(_ summary: LiveSummary) throws {
         lastSummary = summary
-        try flush()
+        try flush(force: true)
     }
 
     func setEnded(_ date: Date) throws {
         endedAt = date
-        try flush()
+        try flush(force: true)
     }
 
-    private func flush() throws {
+    private func flushIfDue() throws {
+        try flush(force: false)
+    }
+
+    private func flush(force: Bool) throws {
+        let now = Date()
+        guard force || lastFlushAt == .distantPast || now.timeIntervalSince(lastFlushAt) >= minFlushInterval else {
+            return
+        }
         let md = renderMarkdown()
         let tmp = URL(fileURLWithPath: mdURL.path + ".tmp")
         try md.write(to: tmp, atomically: false, encoding: .utf8)
         _ = try FileManager.default.replaceItemAt(mdURL, withItemAt: tmp)
+        lastFlushAt = now
     }
 
     private func renderMarkdown() -> String {

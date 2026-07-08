@@ -25,10 +25,9 @@ final class SummaryServerPanel {
         panel.isReleasedWhenClosed = false
         panel.center()
 
-        // URL label
-        let label = NSTextField(labelWithString: "Server URL:")
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 13)
+        let urlLabel = NSTextField(labelWithString: "Server URL:")
+        urlLabel.translatesAutoresizingMaskIntoConstraints = false
+        urlLabel.font = .systemFont(ofSize: 13)
 
         // URL text field
         urlField = NSTextField(frame: .zero)
@@ -71,7 +70,7 @@ final class SummaryServerPanel {
 
         let container = NSView()
         container.translatesAutoresizingMaskIntoConstraints = false
-        container.addSubview(label)
+        container.addSubview(urlLabel)
         container.addSubview(urlField)
         container.addSubview(testButton)
         container.addSubview(saveButton)
@@ -80,10 +79,10 @@ final class SummaryServerPanel {
         panel.contentView = container
 
         NSLayoutConstraint.activate([
-            label.topAnchor.constraint(equalTo: container.topAnchor, constant: 20),
-            label.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
+            urlLabel.topAnchor.constraint(equalTo: container.topAnchor, constant: 20),
+            urlLabel.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
 
-            urlField.topAnchor.constraint(equalTo: label.bottomAnchor, constant: 8),
+            urlField.topAnchor.constraint(equalTo: urlLabel.bottomAnchor, constant: 8),
             urlField.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 20),
             urlField.trailingAnchor.constraint(equalTo: testButton.leadingAnchor, constant: -8),
 
@@ -125,16 +124,13 @@ final class SummaryServerPanel {
 
     @objc private func testTapped() {
         let raw = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !raw.isEmpty else {
+        let validation = Self.validateSummaryURL(raw, allowEmpty: false)
+        if let error = validation.error {
             statusLabel.textColor = .systemRed
-            statusLabel.stringValue = "Please enter a URL"
+            statusLabel.stringValue = error
             return
         }
-        guard let baseURL = URL(string: raw) else {
-            statusLabel.textColor = .systemRed
-            statusLabel.stringValue = "Invalid URL format"
-            return
-        }
+        guard let baseURL = validation.url else { return }
 
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.stringValue = "Testing…"
@@ -152,8 +148,39 @@ final class SummaryServerPanel {
     @objc private func saveTapped() {
         guard let recorder else { return }
         let raw = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let validation = Self.validateSummaryURL(raw, allowEmpty: true)
+        if let error = validation.error {
+            statusLabel.textColor = .systemRed
+            statusLabel.stringValue = error
+            return
+        }
         recorder.liveSummaryURL = raw
         hide()
+    }
+
+    private static func validateSummaryURL(_ raw: String, allowEmpty: Bool) -> (url: URL?, error: String?) {
+        if raw.isEmpty {
+            return allowEmpty ? (nil, nil) : (nil, "Please enter a URL")
+        }
+        guard let components = URLComponents(string: raw),
+              let scheme = components.scheme?.lowercased(),
+              let host = components.host,
+              let url = components.url else {
+            return (nil, "Invalid URL format")
+        }
+
+        if scheme == "https" {
+            return (url, nil)
+        }
+        if scheme == "http", isLocalHost(host) {
+            return (url, nil)
+        }
+        return (nil, "Use HTTPS, except for localhost testing")
+    }
+
+    private static func isLocalHost(_ host: String) -> Bool {
+        let normalized = host.lowercased()
+        return normalized == "localhost" || normalized == "127.0.0.1" || normalized == "::1"
     }
 
     private static func testConnection(baseURL: URL) async -> (success: Bool, message: String) {
@@ -167,14 +194,21 @@ final class SummaryServerPanel {
             "sessionId": "test",
             "transcriptText": "",
             "elapsedSec": 1,
+            "meetingType": "general",
             "isFinal": false,
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: req)
+            let (data, response) = try await URLSession.shared.data(for: req)
             if let http = response as? HTTPURLResponse {
-                return (true, "Server reachable (HTTP \(http.statusCode))")
+                if (200..<300).contains(http.statusCode) {
+                    return (true, "Server OK (HTTP \(http.statusCode))")
+                }
+                let body = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                let suffix = body?.isEmpty == false ? ": \(body!)" : ""
+                return (false, "Server returned HTTP \(http.statusCode)\(suffix)")
             }
             return (true, "Server reachable")
         } catch let error as URLError {

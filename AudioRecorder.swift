@@ -6,10 +6,8 @@ import Combine
 import UserNotifications
 import IOKit.pwr_mgt
 
-// `@unchecked Sendable`: every mutable field below is either confined to the
-// main queue (the @Published ones) or guarded by `micBufferLock`. Crossing
-// queue boundaries via Timer / DispatchQueue.main.async would otherwise trip
-// Swift 6 strict-concurrency warnings on every `self` capture.
+// `@unchecked Sendable`: mutable runtime state is either confined to main,
+// guarded by a lock, or accessed on the serial system-audio queue.
 class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegate, AVCaptureAudioDataOutputSampleBufferDelegate, @unchecked Sendable {
     @Published var isRecording = false
     @Published var elapsedTime: TimeInterval = 0
@@ -19,14 +17,6 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     @Published var captionsEnabled: Bool {
         didSet { UserDefaults.standard.set(captionsEnabled, forKey: "captionsEnabled") }
     }
-    /// User-controlled toggle for the verbatim transcription pipeline.
-    /// Default false — the feature is opt-in. When toggled mid-recording,
-    /// AppDelegate spins up (or tears down) the whisper-server + writer
-    /// live, with a state machine to gate the transition (see
-    /// `VerbatimPipelineState`).
-    @Published var verbatimEnabled: Bool {
-        didSet { UserDefaults.standard.set(verbatimEnabled, forKey: "verbatimEnabled") }
-    }
     @Published var saveDirectory: URL {
         didSet { UserDefaults.standard.set(saveDirectory.path, forKey: "saveDirectory") }
     }
@@ -34,12 +24,6 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     @Published var micAudioLevel: Float = 0
     @Published var selectedMicID: String? {
         didSet { UserDefaults.standard.set(selectedMicID, forKey: "selectedMicID") }
-    }
-    /// Caption / verbatim transcription language. One of "auto", "zh", "en".
-    /// Controls both the existing `Enable Live Captions` panel (future) and the
-    /// new verbatim transcription pipeline. Persisted across launches.
-    @Published var captionLanguage: String {
-        didSet { UserDefaults.standard.set(captionLanguage, forKey: "captionLanguage") }
     }
     @Published var liveSummaryURL: String {
         didSet { UserDefaults.standard.set(liveSummaryURL, forKey: "liveSummaryURL") }
@@ -49,7 +33,10 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     /// Called from the SCStream audio queue (NOT main). The closure receives
     /// Float32 mono samples downsampled to 16 kHz along with that sample rate.
     /// Nil by default; AppDelegate wires this up when captions are enabled.
-    var onPCMChunk: (([Float], Double) -> Void)?
+    var onPCMChunk: (([Float], Double) -> Void)? {
+        get { callbackLock.withLock { onPCMChunkStorage } }
+        set { callbackLock.withLock { onPCMChunkStorage = newValue } }
+    }
 
     /// Fired on main when the underlying SCStream stops with an error
     /// (system audio capture got interrupted by macOS — display lock,
@@ -62,6 +49,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     private var stream: SCStream?
     private var assetWriter: AVAssetWriter?
     private var audioWriterInput: AVAssetWriterInput?  // single mixed track
+    private let systemAudioQueue = DispatchQueue(label: "sys-audio")
     private var captureSession: AVCaptureSession?
     private var timer: Timer?
     private var recordingStartTime: Date?
@@ -72,6 +60,8 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     // Protected by micBufferLock
     private var micBuffer = [Float32]()
     private let micBufferLock = NSLock()
+    private let callbackLock = NSLock()
+    private var onPCMChunkStorage: (([Float], Double) -> Void)?
     private var micConverter: AVAudioConverter?
     private let targetSampleRate: Double = 48000
 
@@ -91,9 +81,7 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     override init() {
         self.useMicrophone = UserDefaults.standard.object(forKey: "useMicrophone") as? Bool ?? true
         self.captionsEnabled = UserDefaults.standard.object(forKey: "captionsEnabled") as? Bool ?? false
-        self.verbatimEnabled = UserDefaults.standard.object(forKey: "verbatimEnabled") as? Bool ?? false
         self.selectedMicID = UserDefaults.standard.string(forKey: "selectedMicID")
-        self.captionLanguage = UserDefaults.standard.string(forKey: "captionLanguage") ?? "auto"
         self.liveSummaryURL = UserDefaults.standard.string(forKey: "liveSummaryURL") ?? ""
         if let path = UserDefaults.standard.string(forKey: "saveDirectory") {
             self.saveDirectory = URL(fileURLWithPath: path)
@@ -125,83 +113,96 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
             let granted = await AVCaptureDevice.requestAccess(for: .audio)
             NSLog("recorder: mic permission=\(granted)")
         }
+        try validateSaveDirectory()
 
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else { throw RecorderError.noDisplay }
+        var outputURL: URL?
+        var pendingWriter: AVAssetWriter?
+        var pendingStream: SCStream?
 
-        // Output file
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        let filename = "Recording-\(formatter.string(from: Date())).mp4"
-        let outputURL = saveDirectory.appendingPathComponent(filename)
-        currentOutputURL = outputURL
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let display = content.displays.first else { throw RecorderError.noDisplay }
 
-        // AVAssetWriter — single audio track
-        let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
-        let audioSettings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: 48000,
-            AVNumberOfChannelsKey: 2,
-            AVEncoderBitRateKey: 192000
-        ]
-        let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
-        input.expectsMediaDataInRealTime = true
-        writer.add(input)
-        writer.startWriting()
-        self.sessionStarted = false
-        self.assetWriter = writer
-        self.audioWriterInput = input
+            // Output file
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+            let filename = "Recording-\(formatter.string(from: Date())).mp4"
+            let url = saveDirectory.appendingPathComponent(filename)
+            outputURL = url
+            currentOutputURL = url
 
-        // Reset mic buffer. Use `withLock` so this stays valid in an async
-        // context — `lock()/unlock()` is unavailable from async in Swift 6.
-        micBufferLock.withLock { micBuffer.removeAll() }
-        micConverter = nil
+            // AVAssetWriter — single audio track
+            let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+            pendingWriter = writer
+            let audioSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: 48000,
+                AVNumberOfChannelsKey: 2,
+                AVEncoderBitRateKey: 192000
+            ]
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: audioSettings)
+            input.expectsMediaDataInRealTime = true
+            writer.add(input)
+            writer.startWriting()
+            self.sessionStarted = false
+            self.assetWriter = writer
+            self.audioWriterInput = input
 
-        // SCKit for system audio
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.sampleRate = 48000
-        config.channelCount = 2
-        config.captureMicrophone = false
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+            // Reset mic buffer. Use `withLock` so this stays valid in an async
+            // context — `lock()/unlock()` is unavailable from async in Swift 6.
+            micBufferLock.withLock { micBuffer.removeAll() }
+            micConverter = nil
 
-        let scStream = SCStream(filter: filter, configuration: config, delegate: self)
-        try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "sys-audio"))
-        try await scStream.startCapture()
-        self.stream = scStream
-        NSLog("recorder: system audio started")
+            // SCKit for system audio
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            let config = SCStreamConfiguration()
+            config.capturesAudio = true
+            config.sampleRate = 48000
+            config.channelCount = 2
+            config.captureMicrophone = false
+            config.width = 2
+            config.height = 2
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-        // AVCaptureSession for mic
-        if useMicrophone {
-            setupMicCapture()
-        }
+            let scStream = SCStream(filter: filter, configuration: config, delegate: self)
+            pendingStream = scStream
+            try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: systemAudioQueue)
+            try await scStream.startCapture()
+            self.stream = scStream
+            NSLog("recorder: system audio started")
 
-        // Prevent macOS from sleeping due to idle while recording.
-        // Without this, the system suspends SCStream after the idle
-        // timeout and our recording gets cut short.
-        var assertionID: IOPMAssertionID = 0
-        let result = IOPMAssertionCreateWithName(
-            kIOPMAssertionTypeNoDisplaySleep as CFString,
-            IOPMAssertionLevel(kIOPMAssertionLevelOn),
-            "MeetingRecorder is recording audio" as CFString,
-            &assertionID
-        )
-        if result == kIOReturnSuccess {
-            sleepAssertionID = assertionID
-            sleepAssertionActive = true
-            NSLog("recorder: idle-sleep assertion created (id=\(assertionID))")
-        }
-
-        recordingStartTime = Date()
-        isRecording = true
-        await MainActor.run {
-            timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-                guard let self, let start = self.recordingStartTime else { return }
-                self.elapsedTime = Date().timeIntervalSince(start)
+            // AVCaptureSession for mic
+            if useMicrophone {
+                setupMicCapture()
             }
+
+            // Prevent macOS from sleeping due to idle while recording.
+            // Without this, the system suspends SCStream after the idle
+            // timeout and our recording gets cut short.
+            var assertionID: IOPMAssertionID = 0
+            let result = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep as CFString,
+                IOPMAssertionLevel(kIOPMAssertionLevelOn),
+                "MeetingRecorder is recording audio" as CFString,
+                &assertionID
+            )
+            if result == kIOReturnSuccess {
+                sleepAssertionID = assertionID
+                sleepAssertionActive = true
+                NSLog("recorder: idle-sleep assertion created (id=\(assertionID))")
+            }
+
+            recordingStartTime = Date()
+            isRecording = true
+            await MainActor.run {
+                timer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+                    guard let self, let start = self.recordingStartTime else { return }
+                    self.elapsedTime = Date().timeIntervalSince(start)
+                }
+            }
+        } catch {
+            await rollBackFailedStart(outputURL: outputURL, writer: pendingWriter, stream: pendingStream)
+            throw error
         }
     }
 
@@ -213,16 +214,21 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
 
         await MainActor.run { timer?.invalidate(); timer = nil }
 
-        audioWriterInput?.markAsFinished()
-        await assetWriter?.finishWriting()
+        let writerToFinish: AVAssetWriter? = systemAudioQueue.sync {
+            audioWriterInput?.markAsFinished()
+            let writer = assetWriter
+            assetWriter = nil
+            audioWriterInput = nil
+            sessionStarted = false
+            return writer
+        }
+        await writerToFinish?.finishWriting()
 
-        if let w = assetWriter, w.status == .failed {
+        if let w = writerToFinish, w.status == .failed {
             NSLog("recorder: writer failed: \(w.error?.localizedDescription ?? "?")")
         }
 
         let savedURL = currentOutputURL
-        assetWriter = nil
-        audioWriterInput = nil
         currentOutputURL = nil
         isRecording = false
         elapsedTime = 0
@@ -238,6 +244,48 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
         }
 
         if let url = savedURL { sendNotification(filename: url.lastPathComponent) }
+    }
+
+    private func rollBackFailedStart(outputURL: URL?, writer: AVAssetWriter?, stream failedStream: SCStream?) async {
+        try? await failedStream?.stopCapture()
+        stream = nil
+
+        captureSession?.stopRunning()
+        captureSession = nil
+
+        await MainActor.run {
+            timer?.invalidate()
+            timer = nil
+        }
+
+        systemAudioQueue.sync {
+            writer?.cancelWriting()
+            if assetWriter !== writer {
+                assetWriter?.cancelWriting()
+            }
+            assetWriter = nil
+            audioWriterInput = nil
+            sessionStarted = false
+        }
+        currentOutputURL = nil
+        recordingStartTime = nil
+        isRecording = false
+        elapsedTime = 0
+        systemAudioLevel = 0
+        micAudioLevel = 0
+        userPinnedMic = false
+        micBufferLock.withLock { micBuffer.removeAll() }
+        micConverter = nil
+
+        if sleepAssertionActive {
+            IOPMAssertionRelease(sleepAssertionID)
+            sleepAssertionActive = false
+            NSLog("recorder: idle-sleep assertion released after failed start")
+        }
+
+        if let outputURL {
+            try? FileManager.default.removeItem(at: outputURL)
+        }
     }
 
     // MARK: - Mic capture
@@ -307,15 +355,21 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
             NSLog("recorder: switchMicDevice — unknown device UID \(id)")
             return
         }
-        if manual { userPinnedMic = true }
-        selectedMicID = id
-        guard isRecording, useMicrophone else { return }
+        guard isRecording, useMicrophone else {
+            if manual { userPinnedMic = true }
+            selectedMicID = id
+            return
+        }
         guard let session = captureSession else {
+            if manual { userPinnedMic = true }
+            selectedMicID = id
             setupMicCapture()
             return
         }
         if let current = session.inputs.first as? AVCaptureDeviceInput,
            current.device.uniqueID == id {
+            if manual { userPinnedMic = true }
+            selectedMicID = id
             return
         }
         guard let dev = Self.availableMicrophones().first(where: { $0.uniqueID == id }),
@@ -330,15 +384,15 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
         if session.canAddInput(newInput) {
             session.addInput(newInput)
             session.commitConfiguration()
+            if manual { userPinnedMic = true }
+            selectedMicID = id
             // If CoreAudio interrupted us when the device topology changed
             // (common when an external mic gets auto-promoted to system
             // default), the session is no longer running. Kick it back up.
             if !session.isRunning { session.startRunning() }
             // Drop samples from the previous device so we don't briefly mix
             // both voices into the next output buffer.
-            micBufferLock.lock()
-            micBuffer.removeAll()
-            micBufferLock.unlock()
+            micBufferLock.withLock { micBuffer.removeAll() }
             micConverter = nil
             NSLog("recorder: switched mic → \(dev.localizedName) [\(id)]")
         } else {
@@ -581,6 +635,8 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
     // MARK: - Level measurement
 
     private nonisolated func peakLevel(from sampleBuffer: CMSampleBuffer) -> Float {
+        guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return 0 }
         guard let dataBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return 0 }
         let length = CMBlockBufferGetDataLength(dataBuffer)
         guard length > 0 else { return 0 }
@@ -589,12 +645,23 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
             guard let base = ptr.baseAddress else { return }
             CMBlockBufferCopyDataBytes(dataBuffer, atOffset: 0, dataLength: length, destination: base)
         }
+        let fmt = asbd.pointee
+        let isFloat = (fmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        let sampleLimit = 4_800
         var peak: Float = 0
         data.withUnsafeBytes { raw in
-            let floats = raw.bindMemory(to: Float32.self)
-            for i in 0..<min(floats.count, 480) {
-                let v = abs(floats[i])
-                if v > peak { peak = v }
+            if isFloat {
+                let floats = raw.bindMemory(to: Float32.self)
+                for i in 0..<min(floats.count, sampleLimit) {
+                    let v = abs(floats[i])
+                    if v > peak { peak = v }
+                }
+            } else if fmt.mBitsPerChannel == 16 {
+                let ints = raw.bindMemory(to: Int16.self)
+                for i in 0..<min(ints.count, sampleLimit) {
+                    let v = abs(Float(ints[i]) / 32768.0)
+                    if v > peak { peak = v }
+                }
             }
         }
         return min(peak, 1.0)
@@ -697,8 +764,24 @@ class AudioRecorder: NSObject, ObservableObject, SCStreamOutput, SCStreamDelegat
 
     enum RecorderError: LocalizedError {
         case noDisplay
+        case saveDirectoryUnavailable(String)
         var errorDescription: String? {
-            switch self { case .noDisplay: return "No display found" }
+            switch self {
+            case .noDisplay:
+                return "No display found"
+            case .saveDirectoryUnavailable(let path):
+                return "Save directory is not writable: \(path)"
+            }
+        }
+    }
+
+    private func validateSaveDirectory() throws {
+        var isDirectory: ObjCBool = false
+        let path = saveDirectory.path
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              FileManager.default.isWritableFile(atPath: path) else {
+            throw RecorderError.saveDirectoryUnavailable(path)
         }
     }
 

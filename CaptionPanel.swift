@@ -159,6 +159,10 @@ final class CaptionPanel {
             text += "\n\nHighlights:"
             for h in s.highlights { text += "\n  • \(h.point) — \(h.detail)" }
         }
+        if !s.lowlights.isEmpty {
+            text += "\n\nLowlights:"
+            for l in s.lowlights { text += "\n  • \(l.point) — \(l.detail)" }
+        }
         if !s.actions.isEmpty {
             text += "\n\nActions:"
             for a in s.actions {
@@ -183,4 +187,3 @@ final class CaptionPanel {
         }
     }
 }
-

@@ -59,8 +59,8 @@ final class SummaryClient {
 
     /// Failable: returns nil when the summary URL is unconfigured,
     /// so the caller can skip wiring up the summary feature instead of
-    /// hitting a dead URL on every tick. Recording + verbatim are
-    /// independent and continue regardless.
+    /// hitting a dead URL on every tick. Recording and captions continue
+    /// regardless.
     init?(backendURL: URL? = LiveSummaryConfig.backendURL,
           sessionId: UUID,
           buffer: TranscriptBuffer,
@@ -77,10 +77,15 @@ final class SummaryClient {
         self.session = URLSession(configuration: cfg)
     }
 
-    func start(intervalSec: TimeInterval = 180) {
+    func start(intervalSec: TimeInterval = 180, initialDelaySec: TimeInterval = 30) {
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: intervalSec, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in await self?.tick() }
+        }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, initialDelaySec) * 1_000_000_000))
+            guard let self, self.timer != nil else { return }
+            await self.tick()
         }
     }
 
@@ -122,6 +127,7 @@ final class SummaryClient {
             "sessionId": sessionId.uuidString.lowercased(),
             "transcriptText": transcript,
             "elapsedSec": elapsedSec,
+            "meetingType": "general",
             "isFinal": isFinal,
         ]
         req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
@@ -161,9 +167,10 @@ final class SummaryClient {
         if full.count <= maxChars { return full }
         let headCount = Int(Double(maxChars) * 0.20)
         let tailCount = Int(Double(maxChars) * 0.70)
-        let fullArray = Array(full)
-        let head = String(fullArray.prefix(headCount))
-        let tail = String(fullArray.suffix(tailCount))
+        let headEnd = full.index(full.startIndex, offsetBy: headCount)
+        let tailStart = full.index(full.endIndex, offsetBy: -tailCount)
+        let head = String(full[..<headEnd])
+        let tail = String(full[tailStart...])
         return head + "\n\n[... truncated ...]\n\n" + tail
     }
 

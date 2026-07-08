@@ -21,6 +21,10 @@ let package = Package(
                 "AppIcon_preview.png",
                 "generate_icon.py",
                 "README.md",
+                "AGENTS.md",
+                "CONTEXT.md",
+                "docs",
+                "CODE_REVIEW_REPORT.md",
                 "MeetingRecorder.app",
                 "MeetingRecorder.dmg",
             ],
@@ -33,11 +37,6 @@ let package = Package(
                 "NotesWriter.swift",
                 "SummaryClient.swift",
                 "SummaryServerPanel.swift",
-                "WhisperServerProcess.swift",
-                "WhisperServerClient.swift",
-                "VerbatimWriter.swift",
-                "VerbatimTranscriber.swift",
-                "LocalAgreementProcessor.swift",
             ]
         )
     ]

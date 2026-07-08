@@ -42,8 +42,6 @@ codesign --force --sign - --entitlements /dev/stdin "$APP_DIR" <<ENTITLEMENTS
 <dict>
     <key>com.apple.security.device.audio-input</key>
     <true/>
-    <key>com.apple.security.device.screen-capture</key>
-    <true/>
     <key>com.apple.security.network.client</key>
     <true/>
 </dict>
